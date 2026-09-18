@@ -34,6 +34,16 @@ external data sources
   `VolatilityProvider`, `FilingsProvider`, `ShortVolumeProvider` in
   `app/providers/base.py`). Swapping `yfinance` for a licensed vendor later should
   only require a new adapter class + a `.env` change, not a schema rewrite.
+* **Security master vs. tracked universe.** `securities` is *everything known*
+  from the SEC + ETF seed list (~10k rows). `tracked_securities` is the much
+  smaller *operational* subset that daily jobs and validation actually run
+  against (see section 5.1). Confusing the two was the source of ~10,000 bogus
+  `MISSING_RECENT_DATA` warnings in an earlier version of this project -- keeping
+  them separate is a deliberate, permanent design rule now.
+* **`--dry-run` means it, everywhere.** Every sync command's dry-run path makes
+  zero network requests, zero Parquet writes, zero DuckDB data mutations, and
+  zero checkpoint writes -- it only reports, from already-known local metadata,
+  what it *would* do. See section 8.1.
 
 ---
 
@@ -91,6 +101,8 @@ Then edit `.env`:
 | `PRICE_PROVIDER` | price backfill/sync | `yfinance` by default; swap to a licensed provider name once one is implemented. |
 | `MAX_WORKERS`, `PRICE_BATCH_SIZE`, `DUCKDB_THREADS`, `DUCKDB_MEMORY_LIMIT` | resource limits | Tuned conservatively for a shared, modest server. |
 | `DATA_ROOT`, `RAW_DIR`, `LAKE_DIR`, `STATE_DIR`, `LOG_DIR` | storage location | See "Moving the data directory" below. |
+| `MARKET_CALENDAR`, `MARKET_DATA_GRACE_MINUTES` | missing-data checks | Which `exchange_calendars` calendar to use (default `XNYS`) and how long after close to wait before flagging today's session as missing. See section 8.2. |
+| `COMPACT_FILE_COUNT_THRESHOLD`, `COMPACT_AVG_FILE_SIZE_MB` | storage health | Thresholds used by `stockdb storage-health` to flag compaction candidates. See section 16. |
 
 **Never commit your real `.env`** -- it's already gitignored. Only `.env.example`
 is committed.
@@ -126,6 +138,13 @@ This creates the `data/` directory skeleton, the DuckDB metadata schema
 (`data/state/catalog.duckdb`), and seeds the symbol-mapping table. Safe to run
 multiple times (idempotent).
 
+Upgrading an **existing** installation never requires deleting or rebuilding
+`catalog.duckdb`: every command applies new table DDL (`CREATE TABLE IF NOT
+EXISTS`) and any accompanying data migration (`app/db/migrations.py`) on
+startup. For example, upgrading to the tracked-universe feature
+automatically (and idempotently) registers every security that already has
+price data in the lake as tracked, without you having to do anything.
+
 ---
 
 ## 5. First run: 10-ticker smoke test
@@ -149,12 +168,46 @@ stockdb sync-vix
 stockdb sync-macro
 ```
 
+Securities that already have price data are **automatically** added to the
+tracked universe (see 5.1), so at this point the 10 smoke-test tickers are
+already tracked -- no extra step needed.
+
 Run data-quality validation and check status:
 
 ```bash
 stockdb validate prices
 stockdb status
 ```
+
+### 5.1 Tracked universe vs. security master
+
+`stockdb sync-universe` populates `securities` with **everything** SEC/the ETF
+seed list knows about (~10,438 rows as of this writing) -- that is the full
+*security master*, not something you operate on day to day.
+
+`tracked_securities` is the small, deliberate, *operational* subset that
+`sync-prices`, `sync-sec-filings`, and `stockdb validate prices` actually run
+against by default. A security becomes tracked in one of two ways:
+
+1. **Automatically**, the first time it already has price data in the lake
+   (an idempotent migration that runs on every command -- see section 12).
+2. **Explicitly**, via the `universe` command group:
+
+```bash
+stockdb universe tracked                 # list the tracked universe
+stockdb universe add AAPL MSFT NVDA      # add tickers (enables price + filings tracking)
+stockdb universe add AAPL --no-filings   # add without enabling SEC filing checks
+stockdb universe remove AAPL             # soft-remove (history is kept, never deleted)
+```
+
+`stockdb backfill-prices` (no `--symbols`) still targets **every active**
+security in the security master -- that is the deliberate, explicit
+full-universe-expansion tool (section 7). Day-to-day commands
+(`sync-prices`, `sync-sec-filings`, `validate prices`, `run-daily`) default to
+the tracked universe instead, specifically so that adding 10,000 SEC-known
+tickers to the security master never implicitly makes them part of daily
+operations. Pass `stockdb validate prices --all-universe` if you deliberately
+want to check every active security instead.
 
 ## 6. Inspecting the data
 
@@ -225,9 +278,52 @@ stockdb backfill-prices --start 2000-01-01 --batch-size 50 --resume
 ## 8. Daily incremental updates
 
 ```bash
-stockdb sync-prices          # refreshes a trailing 10-day window for all active securities
+stockdb sync-prices          # refreshes a trailing 10-day window for the TRACKED price universe
 stockdb run-daily            # universe -> prices -> vix -> macro -> filings -> validate -> report
 ```
+
+### 8.1 What `--dry-run` actually guarantees
+
+```bash
+stockdb run-daily --dry-run
+```
+
+`--dry-run` (on every command that has it) makes **no** HTTP request to SEC,
+Yahoo/yfinance, FRED, or Cboe; writes **no** Parquet file; makes **no** data
+mutation to any DuckDB table (`ingest_runs`, `tracked_securities`,
+`data_quality_issues`, ...); and touches **no** checkpoint file. Each
+ingestion function checks `dry_run` *before* resolving/looping over its
+targets or instantiating a provider, so `run-daily --dry-run` finishes in
+about a second even against a 10,000+ security master -- it never loops over
+more than the small tracked universe, and it never "resolves 10,438 symbols
+and then skips each one in a loop" (an earlier bug). Example output:
+
+```
+Universe    would sync SEC universe + ETF seed list (10438 securities known)
+Prices      would check/update 9 tracked securities
+VIX         would fetch latest VIX
+Macro       SKIPPED - FRED_API_KEY not configured
+Filings     would check 9 tracked CIK(s)
+Validation  0 issues (0 critical) over 9 securities
+```
+
+A missing `FRED_API_KEY` is reported as **SKIPPED**, never as a failure --
+it's a configuration choice, not a system error, and the rest of the
+pipeline keeps going either way (with or without `--dry-run`).
+
+### 8.2 US market trading-day calendar
+
+"Is today's price data missing yet?" is answered using the real NYSE (XNYS)
+trading-session calendar (`app/services/market_calendar.py`, backed by the
+`exchange-calendars` library) -- never a naive `weekday() < 5` check. That
+means weekends *and* US market holidays are never flagged as missing, and a
+session that hasn't closed yet (plus a configurable grace period,
+`MARKET_DATA_GRACE_MINUTES`, default 120) isn't expected to have data yet
+either. This calculation always reasons in `America/New_York` time
+internally regardless of the server's own timezone, so a server running in
+Korea still correctly knows whether "today" (US market time) has even
+started yet. Stored timestamps remain UTC as always; only this one piece of
+"what does 'today' mean for the US market" logic uses NY time.
 
 ### Scheduling
 
@@ -289,14 +385,18 @@ directory skeleton at the new location. Nothing else needs to change.
 | `stockdb init` | Create directories + DuckDB schema + seed config data. |
 | `stockdb sync-universe [--dry-run]` | Sync security master from SEC + ETF seed list. |
 | `stockdb backfill-prices --start DATE [--symbols A,B,C] [--end DATE] [--batch-size N] [--resume] [--dry-run]` | Backfill daily price history. |
-| `stockdb sync-prices [--symbols ...] [--lookback-days N] [--dry-run]` | Incremental daily price refresh. |
+| `stockdb sync-prices [--symbols ...] [--lookback-days N] [--dry-run]` | Incremental daily price refresh for the tracked universe. |
 | `stockdb sync-macro [--series ...] [--start DATE] [--dry-run]` | Sync FRED macro series. |
 | `stockdb sync-vix [--dry-run]` | Sync official Cboe VIX history. |
-| `stockdb sync-sec-filings [--ciks ...] [--dry-run]` | Sync SEC filing metadata (10-K/10-Q/8-K/20-F/6-K). |
-| `stockdb validate prices [--symbols ...] [--dry-run]` | Run data-quality checks. |
+| `stockdb sync-sec-filings [--ciks ...] [--dry-run]` | Sync SEC filing metadata (10-K/10-Q/8-K/20-F/6-K) for the tracked (filings-enabled) CIKs. |
+| `stockdb validate prices [--symbols ...] [--all-universe] [--dry-run]` | Run data-quality checks (tracked universe by default). |
 | `stockdb compact prices [--year Y --month M] [--dry-run]` | Merge small Parquet files into one per partition (also: `macro`, `volatility`, `filings`). |
+| `stockdb storage-health [--dataset NAME]` | Show per-partition file/size stats and flag compaction candidates. |
+| `stockdb universe tracked [--include-disabled]` | List the tracked (operational) universe. |
+| `stockdb universe add TICKER... [--reason TEXT] [--no-filings]` | Add tickers to the tracked universe. |
+| `stockdb universe remove TICKER...` | Soft-remove tickers from the tracked universe (history kept). |
 | `stockdb status` | Show DB/lake/job status as Rich tables. |
-| `stockdb run-daily [--dry-run]` | Run the full daily pipeline end to end. |
+| `stockdb run-daily [--dry-run]` | Run the full daily pipeline end to end (tracked universe only). |
 
 ---
 
@@ -342,7 +442,9 @@ stock-pattern-db/
 * `security_identifiers` -- identifier history (`identifier_type` in `CIK`/`TICKER`, `valid_from`/`valid_to`), so ticker renames never destroy history.
 * `security_snapshots` -- point-in-time universe snapshots (`snapshot_date`, ticker/company/exchange as of that date) to help reduce survivorship bias later.
 * `symbol_mappings` -- canonical ticker <-> provider-specific spelling overrides.
-* `data_quality_issues` -- validation findings (dataset, security_id, date, issue_type, severity, resolved).
+* `data_quality_issues` -- validation findings (dataset, security_id, date, issue_type, severity, resolved). Rows are marked `resolved`, never deleted, once a finding no longer reproduces on a subsequent validation run.
+* `tracked_securities` -- the operational subset of `securities` that daily jobs/validation run against (`enabled`, `price_tracking`, `filings_tracking`, `feature_tracking`, `tracking_reason`, `added_at`/`removed_at`). See section 5.1.
+* `dataset_metadata` -- machine-readable research-integrity flags per dataset (`dataset_name`, `metadata_key`, `metadata_value`). See section 17.
 
 ### Parquet partitioning strategy
 
@@ -419,6 +521,11 @@ for exactly this reason.
   conclusions from the data; validation records findings, it never silently
   deletes or "fixes" data.
 
+These same limitations are also written as **machine-readable metadata**
+(`dataset_metadata` table / `stockdb status`'s "Research integrity" panel) --
+see section 17 -- so a future features/labels/backtest layer can check them
+programmatically instead of relying on someone having read this file.
+
 ---
 
 ## 14. Testing
@@ -428,13 +535,20 @@ source .venv/bin/activate
 pytest
 ```
 
-The test suite never calls live external APIs -- it uses in-memory DuckDB
-connections, `tmp_path`-scoped Settings, and hand-built fixture rows that
-mimic real provider responses (SEC universe rows, price bars, etc.).
-Covered areas: SEC universe parsing/disambiguation, symbol mapping,
-price normalization (nulls preserved, never zero-filled), Parquet
-partition writing + dedup/compaction, atomic file writes, checkpoint
-save/load/resume, validation rules, and the commercial-mode provider guard.
+The test suite (90 tests) never calls live external APIs -- it uses in-memory
+DuckDB connections, `tmp_path`-scoped Settings, `monkeypatch`ed provider
+methods, and hand-built fixture rows that mimic real provider responses (SEC
+universe rows, price bars, etc.). Covered areas: SEC universe
+parsing/disambiguation, symbol mapping, price normalization (nulls
+preserved, never zero-filled), Parquet partition writing + dedup/compaction,
+atomic file writes, checkpoint save/load/resume, validation rules, the
+commercial-mode provider guard, the NYSE trading calendar (weekends/US
+holidays/session-close+grace logic), the tracked-vs-full-universe validation
+scoping (including stale-issue resolution), true dry-run guarantees (zero
+network calls, zero Parquet writes, zero DuckDB row-count changes), storage
+health/compaction-candidate thresholds, research-integrity metadata, and
+migration idempotency (including "never resurrects an explicitly removed
+security").
 
 ---
 
@@ -453,3 +567,58 @@ save/load/resume, validation rules, and the commercial-mode provider guard.
   minutes.
 * Polars/DuckDB are used for all bulk transformations; there are no
   Python `for` loops over large row sets in the hot path.
+
+---
+
+## 16. Storage health / compaction candidates
+
+```bash
+stockdb storage-health                 # every dataset
+stockdb storage-health --dataset prices
+```
+
+Shows, per `dataset/year/month` partition: file count, total size, an
+estimated row count (from Parquet metadata, no full read), average file
+size, and the newest file's timestamp. A partition is flagged as a
+**compaction candidate** when either:
+
+* `file_count >= COMPACT_FILE_COUNT_THRESHOLD` (default 25), or
+* it has more than one file and `avg_file_size_mb < COMPACT_AVG_FILE_SIZE_MB`
+  (default 8).
+
+This is detection only -- **nothing is compacted automatically**, in the
+daily pipeline or anywhere else. Run the existing explicit command for a
+flagged partition:
+
+```bash
+stockdb compact prices --year 2024 --month 01
+```
+
+Delta Lake / Iceberg-style automatic compaction is deliberately out of
+scope; the append + view-dedup + explicit-compact architecture (section 12)
+is unchanged, this just adds visibility into when running `compact` is
+actually worth it.
+
+---
+
+## 17. Research integrity / survivorship-bias metadata
+
+`stockdb status` ends with a small "Research integrity" panel:
+
+```
+Historical universe complete    NO
+Survivorship-safe universe      NO
+Point-in-time security master   NO
+Price provider                  yfinance
+Commercial use safe             NO
+```
+
+This is backed by the `dataset_metadata` table (`dataset_name`,
+`metadata_key`, `metadata_value`), seeded/refreshed idempotently on every
+command (`app/services/dataset_metadata_service.py`). It exists so a future
+features/labels/backtest layer can check e.g. `survivorship_safe`
+programmatically before drawing conclusions from a backtest, instead of
+relying on someone having read section 13. `research_only_price_provider`
+(shown inverted as "Commercial use safe") is derived automatically from the
+active `PRICE_PROVIDER`'s `ProviderCapabilities.commercial_use_safe` --
+switching providers updates this the next time any command runs.
