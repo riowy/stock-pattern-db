@@ -37,7 +37,7 @@ logger = get_logger("universe_sync")
 
 @dataclass
 class UniverseSyncResult:
-    run_id: str
+    run_id: str | None
     securities_seen: int
     identifiers_seen: int
     snapshots_written: int
@@ -150,6 +150,19 @@ def _bulk_upsert_snapshots(con: duckdb.DuckDBPyConnection, snapshots: list[Secur
 def sync_universe(
     settings: Settings, con: duckdb.DuckDBPyConnection, dry_run: bool = False
 ) -> UniverseSyncResult:
+    if dry_run:
+        # True dry-run: no HTTP call to SEC, no ingest_runs row. We can only
+        # report what's already known locally (current security count +
+        # configured ETF seed list size), not what SEC would return today.
+        current_count = con.execute("SELECT count(*) FROM securities").fetchone()[0]
+        logger.info(
+            "[dry-run] would sync SEC company_tickers_exchange.json + %d ETF seed tickers "
+            "(no request made; %d securities currently known locally)",
+            len(SEED_ETF_TICKERS),
+            current_count,
+        )
+        return UniverseSyncResult(run_id=None, securities_seen=current_count, identifiers_seen=0, snapshots_written=0, dry_run=True)
+
     provider = SecUniverseProvider(settings)
     run_id = start_run(con, provider.capabilities.provider_name, "security_master", {"dry_run": dry_run})
 
@@ -166,16 +179,6 @@ def sync_universe(
             identifiers=sec_universe.identifiers + etf_universe.identifiers,
             snapshots=sec_universe.snapshots + etf_universe.snapshots,
         )
-
-        if dry_run:
-            logger.info(
-                "[dry-run] would upsert %d securities, %d identifiers, %d snapshots",
-                len(combined.securities),
-                len(combined.identifiers),
-                len(combined.snapshots),
-            )
-            finish_run(con, run_id, "success", len(combined.securities), len(combined.securities), 0, 0)
-            return UniverseSyncResult(run_id, len(combined.securities), len(combined.identifiers), 0, True)
 
         _bulk_upsert_securities(con, combined.securities)
         _bulk_upsert_identifiers(con, combined.identifiers)

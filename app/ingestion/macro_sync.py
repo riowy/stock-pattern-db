@@ -17,14 +17,19 @@ from app.utils.parquet_io import LakeDataset
 
 logger = get_logger("macro_sync")
 
+FRED_KEY_MISSING_REASON = "FRED_API_KEY not configured"
+
 
 @dataclass
 class MacroSyncResult:
-    run_id: str
+    run_id: str | None
     series_synced: int
     series_failed: int
     rows_written: int
     failures: list[str] = field(default_factory=list)
+    status: str = "success"  # success | partial | failed | skipped | planned
+    skip_reason: str | None = None
+    dry_run: bool = False
 
 
 def sync_macro(
@@ -35,6 +40,25 @@ def sync_macro(
     dry_run: bool = False,
 ) -> MacroSyncResult:
     targets = series_ids or list(FRED_SEED_SERIES.keys())
+
+    # A missing API key is a configuration choice, not a system failure --
+    # report it as SKIPPED, never as FAILED, and never raise (the daily
+    # pipeline must keep going).
+    if not settings.fred_api_key.strip():
+        logger.info("SKIPPED macro sync: %s", FRED_KEY_MISSING_REASON)
+        return MacroSyncResult(
+            run_id=None, series_synced=0, series_failed=0, rows_written=0,
+            status="skipped", skip_reason=FRED_KEY_MISSING_REASON,
+        )
+
+    if dry_run:
+        # True dry-run: no provider instantiation, no HTTP call, no DB write.
+        logger.info("[dry-run] would fetch %d FRED series (no request made): %s", len(targets), targets)
+        return MacroSyncResult(
+            run_id=None, series_synced=len(targets), series_failed=0, rows_written=0,
+            status="planned", dry_run=True,
+        )
+
     provider = FredMacroProvider(settings)
     lake = LakeDataset(settings.macro_dir, "date", ["series_id", "date"], ["series_id", "date"])
 
@@ -49,10 +73,6 @@ def sync_macro(
 
     try:
         for series_id in targets:
-            if dry_run:
-                logger.info("[dry-run] would fetch FRED series %s", series_id)
-                successful += 1
-                continue
             try:
                 fetch = provider.fetch_series(series_id, start=start)
                 df = normalize_macro_rows(fetch)
@@ -82,7 +102,7 @@ def sync_macro(
             con, run_id, status, requested_items=len(targets), successful_items=successful,
             failed_items=failed, rows_written=rows_written,
         )
-        return MacroSyncResult(run_id, successful, failed, rows_written, failures)
+        return MacroSyncResult(run_id, successful, failed, rows_written, failures, status=status)
     except Exception as exc:  # noqa: BLE001
         finish_run(con, run_id, "failed", error_message=str(exc))
         raise

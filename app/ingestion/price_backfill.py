@@ -24,6 +24,7 @@ from app.normalization.prices import normalize_price_rows
 from app.normalization.symbols import resolve_provider_symbol
 from app.providers.registry import get_price_provider
 from app.services.manifest_service import finish_run, record_source_file, start_run
+from app.services.tracked_universe_service import get_tracked_price_security_ids
 from app.utils.logging import get_logger
 from app.utils.parquet_io import LakeDataset
 
@@ -38,7 +39,7 @@ class SymbolFailure:
 
 @dataclass
 class BackfillResult:
-    run_id: str
+    run_id: str | None
     total_symbols: int
     successful: int
     failed: int
@@ -46,13 +47,26 @@ class BackfillResult:
     failures: list[SymbolFailure] = field(default_factory=list)
     resumed: bool = False
     checkpoint_job_key: str | None = None
+    dry_run: bool = False
 
 
-def resolve_symbols(con: duckdb.DuckDBPyConnection, symbols: list[str] | None) -> list[tuple[str, str]]:
+def resolve_symbols(
+    con: duckdb.DuckDBPyConnection, symbols: list[str] | None, default_scope: str = "all_active"
+) -> list[tuple[str, str]]:
     """Return [(canonical_ticker, security_id), ...].
 
     Looks up ``securities.primary_ticker`` first, then falls back to the
     ``security_identifiers`` TICKER history (currently-valid rows only).
+
+    When ``symbols`` is omitted, ``default_scope`` decides the fallback:
+      * "all_active" -- every active security in the (large) security
+        master. This is the deliberate, explicit-full-backfill scope used
+        by ``backfill-prices`` when expanding coverage (10 -> 100 -> 500 ->
+        full universe), matching the README's expansion workflow.
+      * "tracked" -- only the small operational ``tracked_securities`` set.
+        Used by day-to-day incremental sync (``sync-prices``, ``run-daily``)
+        so routine operations never implicitly touch the full ~10k-security
+        universe.
     """
     if symbols:
         resolved: list[tuple[str, str]] = []
@@ -81,6 +95,18 @@ def resolve_symbols(con: duckdb.DuckDBPyConnection, symbols: list[str] | None) -
             resolved.append((ticker, row[0]))
         return resolved
 
+    if default_scope == "tracked":
+        tracked_ids = set(get_tracked_price_security_ids(con))
+        if not tracked_ids:
+            return []
+        placeholders = ", ".join("?" for _ in tracked_ids)
+        rows = con.execute(
+            f"SELECT primary_ticker, security_id FROM securities "
+            f"WHERE security_id IN ({placeholders}) AND primary_ticker IS NOT NULL ORDER BY primary_ticker",
+            list(tracked_ids),
+        ).fetchall()
+        return [(r[0], r[1]) for r in rows]
+
     rows = con.execute(
         "SELECT primary_ticker, security_id FROM securities WHERE is_active = TRUE AND primary_ticker IS NOT NULL "
         "ORDER BY primary_ticker"
@@ -98,15 +124,37 @@ def run_price_ingestion(
     resume: bool,
     dry_run: bool = False,
     job_name: str = "backfill_prices",
+    default_scope: str = "all_active",
 ) -> BackfillResult:
-    targets = resolve_symbols(con, symbols)
+    targets = resolve_symbols(con, symbols, default_scope=default_scope)
     if not targets:
-        raise ValueError("No symbols resolved. Run 'stockdb sync-universe' first or check --symbols.")
+        if dry_run:
+            return BackfillResult(run_id=None, total_symbols=0, successful=0, failed=0, rows_written=0, dry_run=True)
+        raise ValueError(
+            "No symbols resolved. Run 'stockdb sync-universe' first, pass --symbols, or "
+            "'stockdb universe add <TICKER>...' to populate the tracked universe."
+        )
+
+    if dry_run:
+        # True dry-run: no provider instantiation, no network call, no DuckDB
+        # write, no checkpoint touch, no per-symbol loop -- just report what
+        # *would* happen based on locally-known metadata.
+        logger.info(
+            "[dry-run] would fetch daily bars for %d symbol(s) from %s to %s (provider=%s): %s",
+            len(targets),
+            start,
+            end or "latest",
+            settings.price_provider,
+            [t for t, _ in targets][:10] if len(targets) <= 10 else f"{len(targets)} symbols",
+        )
+        return BackfillResult(
+            run_id=None, total_symbols=len(targets), successful=len(targets), failed=0, rows_written=0, dry_run=True
+        )
 
     provider = get_price_provider(settings.price_provider, settings)
 
     params = {
-        "symbols": sorted(t for t, _ in targets) if symbols else "ALL_ACTIVE",
+        "symbols": sorted(t for t, _ in targets) if symbols else f"DEFAULT_SCOPE:{default_scope}",
         "start": start.isoformat(),
         "end": end.isoformat() if end else None,
         "batch_size": batch_size,
@@ -152,12 +200,6 @@ def run_price_ingestion(
             logger.info("Processing batch of %d symbols: %s", len(batch), batch)
 
             for canonical in batch:
-                if dry_run:
-                    logger.info("[dry-run] would fetch daily bars for %s from %s to %s", canonical, start, end)
-                    successful += 1
-                    state["completed"].append(canonical)
-                    continue
-
                 security_id = symbol_to_security[canonical]
                 default_provider_symbol = provider.to_provider_symbol(canonical)
                 provider_symbol = resolve_provider_symbol(

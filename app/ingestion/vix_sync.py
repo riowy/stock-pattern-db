@@ -18,22 +18,24 @@ logger = get_logger("vix_sync")
 
 @dataclass
 class VixSyncResult:
-    run_id: str
+    run_id: str | None
     rows_written: int
     status: str
+    dry_run: bool = False
 
 
 def sync_vix(settings: Settings, con: duckdb.DuckDBPyConnection, dry_run: bool = False) -> VixSyncResult:
+    if dry_run:
+        # True dry-run: no provider instantiation, no HTTP call, no
+        # ingest_runs row, no Parquet write.
+        logger.info("[dry-run] would fetch the latest Cboe VIX history (no request made)")
+        return VixSyncResult(run_id=None, rows_written=0, status="planned", dry_run=True)
+
     provider = CboeVixProvider(settings)
     lake = LakeDataset(settings.volatility_dir, "date", ["date"], ["date"])
     run_id = start_run(con, provider.capabilities.provider_name, "volatility", {})
 
     try:
-        if dry_run:
-            logger.info("[dry-run] would fetch full Cboe VIX history")
-            finish_run(con, run_id, "success", requested_items=1, successful_items=1, failed_items=0, rows_written=0)
-            return VixSyncResult(run_id, 0, "success")
-
         fetch = provider.fetch_history()
         df = normalize_vix_rows(fetch)
         rows_written = 0
