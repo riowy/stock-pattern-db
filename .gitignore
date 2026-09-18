@@ -15,15 +15,18 @@ uv.lock.tmp
 .env
 
 # Data lake / raw downloads / DuckDB state / logs are local research data,
-# not source code. Keep the directory structure (.gitkeep) but not contents.
-data/raw/**
-!data/raw/**/.gitkeep
-data/lake/**
-!data/lake/**/.gitkeep
-data/state/**
-!data/state/**/.gitkeep
-data/logs/**
-!data/logs/**/.gitkeep
+# not source code. We ignore by file pattern (not by whole-directory
+# wildcard) so the directory skeleton -- and any .gitkeep placeholder --
+# stays trackable; git cannot re-include files inside a directory that was
+# itself excluded by an earlier "dir/**" pattern, so we avoid that pattern.
+data/raw/**/*.json
+data/raw/**/*.csv
+data/raw/**/*.txt
+data/lake/**/*.parquet
+data/state/*.duckdb
+data/state/*.duckdb.wal
+data/state/checkpoints/*.json
+data/logs/*.log*
 
 # OS
 .DS_Store
