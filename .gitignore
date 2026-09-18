@@ -11,8 +11,11 @@ venv/
 # uv
 uv.lock.tmp
 
-# Environment secrets (only .env.example is committed)
+# Environment secrets (only .env.example is committed).
+# The repo root .gitignore has a blanket ".env*" rule that would otherwise
+# also hide .env.example -- un-ignore it explicitly here.
 .env
+!.env.example
 
 # Data lake / raw downloads / DuckDB state / logs are local research data,
 # not source code. We ignore by file pattern (not by whole-directory
