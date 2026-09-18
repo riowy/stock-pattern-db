@@ -11,9 +11,11 @@ Expected input schema (superset of app.normalization.prices.PRICE_BAR_SCHEMA):
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime
 
 import polars as pl
+
+from app.services.market_calendar import MarketCalendarService
 
 Issue = dict
 
@@ -162,24 +164,39 @@ def check_sudden_price_change(
 
 
 def check_missing_recent_data(
-    df: pl.DataFrame, expected_active_security_ids: list[str], as_of: date, max_gap_days: int = 5
+    df: pl.DataFrame,
+    expected_security_ids: list[str],
+    calendar: MarketCalendarService,
+    now: datetime | None = None,
+    max_gap_sessions: int = 5,
 ) -> list[Issue]:
-    """Flag active securities whose latest known bar is more than
-    ``max_gap_days`` calendar days behind ``as_of``."""
+    """Flag *tracked* securities (see caller -- ``expected_security_ids``
+    should already be scoped to the tracked price universe, not the full
+    security master) whose latest known bar is more than
+    ``max_gap_sessions`` US-market **trading sessions** behind the latest
+    session that should currently have data available.
+
+    Uses the real NYSE trading calendar (``MarketCalendarService``), not
+    calendar weekdays: weekends and US market holidays never count as
+    "missing" sessions, and a session that has not closed yet (plus a
+    configurable grace period) is not expected to have data yet either.
+    """
     issues: list[Issue] = []
-    if not expected_active_security_ids:
+    if not expected_security_ids:
         return issues
 
+    latest_expected = calendar.latest_expected_session(now)
+    cutoff = calendar.sessions_ago(latest_expected, max_gap_sessions)
+
     if df.height == 0:
-        for sid in expected_active_security_ids:
+        for sid in expected_security_ids:
             issues.append(_issue(sid, None, "MISSING_RECENT_DATA", "warning", "No price data at all"))
         return issues
 
     last_dates = df.group_by("security_id").agg(pl.col("date").max().alias("last_date"))
     last_date_map = {row["security_id"]: row["last_date"] for row in last_dates.iter_rows(named=True)}
-    cutoff = as_of - timedelta(days=max_gap_days)
 
-    for sid in expected_active_security_ids:
+    for sid in expected_security_ids:
         last_date = last_date_map.get(sid)
         if last_date is None:
             issues.append(_issue(sid, None, "MISSING_RECENT_DATA", "warning", "No price data at all"))
@@ -190,7 +207,8 @@ def check_missing_recent_data(
                     last_date,
                     "MISSING_RECENT_DATA",
                     "warning",
-                    f"Last available date is {last_date}, more than {max_gap_days} days behind {as_of}",
+                    f"Last available date is {last_date}, more than {max_gap_sessions} trading "
+                    f"sessions behind the latest expected session ({latest_expected})",
                 )
             )
     return issues

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime
 
 import polars as pl
 
+from app.services.market_calendar import MarketCalendarService
 from app.validation.rules import (
     check_invalid_dates,
     check_missing_recent_data,
@@ -12,6 +13,8 @@ from app.validation.rules import (
     check_sudden_price_change,
     check_weekend_dates,
 )
+
+CALENDAR = MarketCalendarService()
 
 
 def _price_df(rows: list[dict]) -> pl.DataFrame:
@@ -108,17 +111,21 @@ def test_check_sudden_price_change_ignores_small_moves() -> None:
 
 def test_check_missing_recent_data_flags_stale_security() -> None:
     df = _price_df([{"date": "2020-01-02"}])
-    issues = check_missing_recent_data(df, ["S1"], as_of=date(2024, 1, 1), max_gap_days=5)
+    # 2024-01-02 (Tue) after close+grace -> latest expected session = 2024-01-02.
+    now = datetime(2024, 1, 2, 23, 0, tzinfo=UTC)
+    issues = check_missing_recent_data(df, ["S1"], CALENDAR, now=now, max_gap_sessions=5)
     assert any(i["issue_type"] == "MISSING_RECENT_DATA" for i in issues)
 
 
 def test_check_missing_recent_data_ok_for_fresh_security() -> None:
-    df = _price_df([{"date": "2024-01-01"}])
-    issues = check_missing_recent_data(df, ["S1"], as_of=date(2024, 1, 2), max_gap_days=5)
+    df = _price_df([{"date": "2024-01-02"}])  # a real NYSE trading day
+    now = datetime(2024, 1, 3, 23, 0, tzinfo=UTC)  # next trading day, after close
+    issues = check_missing_recent_data(df, ["S1"], CALENDAR, now=now, max_gap_sessions=5)
     assert issues == []
 
 
 def test_check_missing_recent_data_flags_security_with_no_data_at_all() -> None:
-    df = _price_df([{"date": "2024-01-01"}])
-    issues = check_missing_recent_data(df, ["S1", "S2"], as_of=date(2024, 1, 2), max_gap_days=5)
+    df = _price_df([{"date": "2024-01-02"}])
+    now = datetime(2024, 1, 3, 23, 0, tzinfo=UTC)
+    issues = check_missing_recent_data(df, ["S1", "S2"], CALENDAR, now=now, max_gap_sessions=5)
     assert any(i["security_id"] == "S2" and i["issue_type"] == "MISSING_RECENT_DATA" for i in issues)
