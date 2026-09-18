@@ -1,0 +1,126 @@
+"""Central application configuration.
+
+All tunables come from environment variables (see ``.env.example``). Nothing
+here should hardcode API keys, absolute machine-specific paths, or timezone
+assumptions -- see AGENTS-level requirements in the project README.
+"""
+
+from __future__ import annotations
+
+from functools import lru_cache
+from pathlib import Path
+
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    """Runtime configuration loaded from environment variables / .env file."""
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        case_sensitive=False,
+    )
+
+    # --- external API credentials -------------------------------------------------
+    sec_user_agent: str = Field(
+        default="",
+        description="Required contact string for SEC EDGAR requests, e.g. "
+        "'StockPatternResearch you@example.com'.",
+    )
+    fred_api_key: str = Field(default="", description="FRED API key (free).")
+
+    # --- licensing / commercial-use safety -----------------------------------------
+    commercial_mode: bool = Field(
+        default=False,
+        description="When True, providers not marked commercial_use_safe are refused.",
+    )
+
+    # --- provider selection ----------------------------------------------------------
+    price_provider: str = Field(default="yfinance")
+
+    # --- resource limits ---------------------------------------------------------
+    max_workers: int = Field(default=4, ge=1, le=32)
+    price_batch_size: int = Field(default=50, ge=1, le=1000)
+    duckdb_threads: int = Field(default=6, ge=1, le=64)
+    duckdb_memory_limit: str = Field(default="24GB")
+
+    # --- SEC rate limiting ---------------------------------------------------------
+    sec_requests_per_second: float = Field(default=3.0, gt=0, le=10.0)
+
+    # --- data directories -----------------------------------------------------------
+    data_root: Path = Field(default=Path("./data"))
+    raw_dir: Path = Field(default=Path("./data/raw"))
+    lake_dir: Path = Field(default=Path("./data/lake"))
+    state_dir: Path = Field(default=Path("./data/state"))
+    log_dir: Path = Field(default=Path("./data/logs"))
+
+    # --- logging ---------------------------------------------------------------------
+    log_level: str = Field(default="INFO")
+
+    @field_validator("sec_requests_per_second")
+    @classmethod
+    def _cap_sec_rate(cls, v: float) -> float:
+        # Hard safety ceiling regardless of what a user puts in .env.
+        return min(v, 10.0)
+
+    # --- derived paths -----------------------------------------------------------------
+    @property
+    def duckdb_path(self) -> Path:
+        return self.state_dir / "catalog.duckdb"
+
+    @property
+    def checkpoints_dir(self) -> Path:
+        return self.state_dir / "checkpoints"
+
+    @property
+    def prices_daily_dir(self) -> Path:
+        return self.lake_dir / "prices_daily"
+
+    @property
+    def corporate_actions_dir(self) -> Path:
+        return self.lake_dir / "corporate_actions"
+
+    @property
+    def macro_dir(self) -> Path:
+        return self.lake_dir / "macro"
+
+    @property
+    def volatility_dir(self) -> Path:
+        return self.lake_dir / "volatility"
+
+    @property
+    def filings_dir(self) -> Path:
+        return self.lake_dir / "filings"
+
+    @property
+    def short_volume_dir(self) -> Path:
+        return self.lake_dir / "short_volume"
+
+    def ensure_directories(self) -> None:
+        """Create the standard directory skeleton if it does not exist yet."""
+        for path in (
+            self.raw_dir / "sec",
+            self.raw_dir / "fred",
+            self.raw_dir / "cboe",
+            self.raw_dir / "yfinance",
+            self.raw_dir / "sec_filings",
+            self.prices_daily_dir,
+            self.corporate_actions_dir,
+            self.macro_dir,
+            self.volatility_dir,
+            self.filings_dir,
+            self.short_volume_dir,
+            self.state_dir,
+            self.checkpoints_dir,
+            self.log_dir,
+        ):
+            path.mkdir(parents=True, exist_ok=True)
+
+
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    """Cached settings singleton. Use ``get_settings.cache_clear()`` in tests."""
+    return Settings()

@@ -1,0 +1,173 @@
+"""DuckDB metadata/catalog schema.
+
+Only reference data, job bookkeeping, and data-quality findings live in
+DuckDB tables. Bulk OHLCV/macro/etc. time series live in the Parquet lake
+(``app/utils/parquet_io.py``) and are exposed to SQL through views created
+by ``create_lake_views``.
+"""
+
+from __future__ import annotations
+
+import duckdb
+
+_DDL_STATEMENTS: list[str] = [
+    # --- job / provenance bookkeeping -----------------------------------------
+    """
+    CREATE TABLE IF NOT EXISTS ingest_runs (
+        run_id            TEXT PRIMARY KEY,
+        provider          TEXT NOT NULL,
+        dataset           TEXT NOT NULL,
+        started_at        TIMESTAMP NOT NULL,
+        finished_at       TIMESTAMP,
+        status            TEXT NOT NULL,       -- running | success | partial | failed
+        requested_items   INTEGER,
+        successful_items  INTEGER,
+        failed_items      INTEGER,
+        rows_written      BIGINT,
+        error_message     TEXT,
+        params_json       TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS source_files (
+        file_id       TEXT PRIMARY KEY,
+        run_id        TEXT NOT NULL,
+        provider      TEXT NOT NULL,
+        dataset       TEXT NOT NULL,
+        path          TEXT NOT NULL,
+        retrieved_at  TIMESTAMP NOT NULL,
+        checksum      TEXT,
+        row_count     BIGINT,
+        min_date      DATE,
+        max_date      DATE
+    )
+    """,
+    # --- security master -------------------------------------------------------
+    """
+    CREATE TABLE IF NOT EXISTS securities (
+        security_id     TEXT PRIMARY KEY,
+        cik             TEXT,
+        company_name    TEXT,
+        primary_ticker  TEXT,
+        exchange        TEXT,
+        asset_type      TEXT,
+        currency        TEXT,
+        is_active       BOOLEAN NOT NULL DEFAULT TRUE,
+        first_seen_at   TIMESTAMP NOT NULL,
+        last_seen_at    TIMESTAMP NOT NULL,
+        created_at      TIMESTAMP NOT NULL,
+        updated_at      TIMESTAMP NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS security_identifiers (
+        security_id       TEXT NOT NULL,
+        identifier_type    TEXT NOT NULL,   -- TICKER | CIK | ISIN | ...
+        identifier_value   TEXT NOT NULL,
+        valid_from         DATE NOT NULL,
+        valid_to           DATE,
+        source             TEXT NOT NULL,
+        PRIMARY KEY (security_id, identifier_type, identifier_value, valid_from)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS security_snapshots (
+        snapshot_date   DATE NOT NULL,
+        security_id     TEXT NOT NULL,
+        ticker          TEXT,
+        company_name    TEXT,
+        exchange        TEXT,
+        source          TEXT NOT NULL,
+        PRIMARY KEY (snapshot_date, security_id)
+    )
+    """,
+    # --- symbol mapping (canonical <-> provider ticker spelling) ----------------
+    """
+    CREATE TABLE IF NOT EXISTS symbol_mappings (
+        canonical_symbol  TEXT NOT NULL,
+        provider          TEXT NOT NULL,
+        provider_symbol   TEXT NOT NULL,
+        source            TEXT NOT NULL,
+        updated_at        TIMESTAMP NOT NULL,
+        PRIMARY KEY (canonical_symbol, provider)
+    )
+    """,
+    # --- data quality -------------------------------------------------------------
+    """
+    CREATE TABLE IF NOT EXISTS data_quality_issues (
+        issue_id      TEXT PRIMARY KEY,
+        dataset       TEXT NOT NULL,
+        security_id   TEXT,
+        date          DATE,
+        issue_type    TEXT NOT NULL,
+        severity      TEXT NOT NULL,        -- critical | warning | info
+        details       TEXT,
+        detected_at   TIMESTAMP NOT NULL,
+        resolved      BOOLEAN NOT NULL DEFAULT FALSE
+    )
+    """,
+]
+
+_INDEXES: list[str] = [
+    "CREATE INDEX IF NOT EXISTS idx_source_files_run_id ON source_files(run_id)",
+    "CREATE INDEX IF NOT EXISTS idx_security_identifiers_value ON security_identifiers(identifier_value)",
+    "CREATE INDEX IF NOT EXISTS idx_dqi_dataset ON data_quality_issues(dataset, resolved)",
+]
+
+
+def apply_schema(con: duckdb.DuckDBPyConnection) -> None:
+    """Create all metadata tables/indexes if they do not already exist."""
+    for stmt in _DDL_STATEMENTS:
+        con.execute(stmt)
+    for stmt in _INDEXES:
+        con.execute(stmt)
+
+
+def create_lake_views(con: duckdb.DuckDBPyConnection, settings) -> None:  # noqa: ANN001
+    """Create/refresh DuckDB views over the Parquet lake for convenient SQL.
+
+    Each view applies a "last write wins" dedup (by ``retrieved_at``) over
+    ``dedup_keys`` so callers never have to think about overlapping
+    re-ingestion runs. Views are skipped (not created) for datasets that have
+    no Parquet files yet.
+    """
+    from app.utils.parquet_io import LakeDataset
+
+    datasets: dict[str, LakeDataset] = {
+        "prices_daily": LakeDataset(
+            settings.prices_daily_dir, "date", ["security_id", "date"], ["security_id", "date"]
+        ),
+        "corporate_actions": LakeDataset(
+            settings.corporate_actions_dir,
+            "effective_date",
+            ["security_id", "effective_date", "action_type"],
+            ["security_id", "effective_date"],
+        ),
+        "macro": LakeDataset(settings.macro_dir, "date", ["series_id", "date"], ["series_id", "date"]),
+        "volatility": LakeDataset(settings.volatility_dir, "date", ["date"], ["date"]),
+        "filings": LakeDataset(
+            settings.filings_dir, "filing_date", ["accession_number"], ["security_id", "filing_date"]
+        ),
+        "short_volume": LakeDataset(
+            settings.short_volume_dir, "date", ["security_id", "date"], ["security_id", "date"]
+        ),
+    }
+
+    for name, ds in datasets.items():
+        if not ds.has_any_files():
+            continue
+        glob_path = ds.glob_pattern().replace("'", "''")
+        key_cols = ", ".join(ds.dedup_keys)
+        sql = f"""
+            CREATE OR REPLACE VIEW {name} AS
+            SELECT * EXCLUDE (__rn)
+            FROM (
+                SELECT *, row_number() OVER (
+                    PARTITION BY {key_cols}
+                    ORDER BY retrieved_at DESC
+                ) AS __rn
+                FROM read_parquet('{glob_path}', hive_partitioning = true)
+            )
+            WHERE __rn = 1
+        """
+        con.execute(sql)

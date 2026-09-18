@@ -1,0 +1,44 @@
+[project]
+name = "stock-pattern-db"
+version = "0.1.0"
+description = "Personal research data lake / database foundation for US equity pattern research."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Proprietary - personal research use" }
+dependencies = [
+    "duckdb>=1.1.0",
+    "polars>=1.9.0",
+    "pyarrow>=17.0.0",
+    "httpx>=0.27.0",
+    "pydantic>=2.8.0",
+    "pydantic-settings>=2.4.0",
+    "typer>=0.12.5",
+    "rich>=13.8.0",
+    "tenacity>=9.0.0",
+    "yfinance>=0.2.43",
+    "python-dateutil>=2.9.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-mock>=3.14.0",
+    "respx>=0.21.1",
+]
+
+[project.scripts]
+stockdb = "app.cli.main:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.uv]
+package = true

@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# uv
+uv.lock.tmp
+
+# Environment secrets (only .env.example is committed)
+.env
+
+# Data lake / raw downloads / DuckDB state / logs are local research data,
+# not source code. Keep the directory structure (.gitkeep) but not contents.
+data/raw/**
+!data/raw/**/.gitkeep
+data/lake/**
+!data/lake/**/.gitkeep
+data/state/**
+!data/state/**/.gitkeep
+data/logs/**
+!data/logs/**/.gitkeep
+
+# OS
+.DS_Store
