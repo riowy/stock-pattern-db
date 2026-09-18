@@ -26,7 +26,12 @@ DATASET_DIR_NAMES: dict[str, str] = {
 }
 
 
-def _dataset(lake_dir: Path, name: str) -> LakeDataset:
+def get_lake_dataset(lake_dir: Path, name: str) -> LakeDataset:
+    """Build the ``LakeDataset`` handle for one of the known dataset keys.
+
+    Shared by ``compact_dataset`` below and ``storage_health_service`` so
+    both use the exact same partitioning definition per dataset.
+    """
     if name not in DATASET_DIRS:
         raise ValueError(f"Unknown dataset '{name}'. Available: {', '.join(DATASET_DIRS)}")
     date_col, dedup_keys, sort_keys = DATASET_DIRS[name]
@@ -36,7 +41,7 @@ def _dataset(lake_dir: Path, name: str) -> LakeDataset:
 def compact_dataset(
     lake_dir: Path, name: str, year: int | None = None, month: int | None = None, dry_run: bool = False
 ) -> list[CompactResult]:
-    ds = _dataset(lake_dir, name)
+    ds = get_lake_dataset(lake_dir, name)
 
     if year is not None and month is not None:
         partitions = [(year, month)]
