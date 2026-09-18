@@ -106,6 +106,36 @@ _DDL_STATEMENTS: list[str] = [
         resolved      BOOLEAN NOT NULL DEFAULT FALSE
     )
     """,
+    # --- tracked (operational) universe --------------------------------------------
+    # ``securities`` is everything known from the security master. This table is
+    # the much smaller subset we actually collect data for and validate.
+    """
+    CREATE TABLE IF NOT EXISTS tracked_securities (
+        security_id       TEXT PRIMARY KEY,
+        enabled           BOOLEAN NOT NULL DEFAULT TRUE,
+        tracking_reason   TEXT,
+        added_at          TIMESTAMP NOT NULL,
+        removed_at        TIMESTAMP,
+        price_tracking    BOOLEAN NOT NULL DEFAULT TRUE,
+        filings_tracking  BOOLEAN NOT NULL DEFAULT FALSE,
+        feature_tracking  BOOLEAN NOT NULL DEFAULT FALSE,
+        notes             TEXT
+    )
+    """,
+    # --- research-integrity / survivorship-bias metadata ---------------------------
+    # Machine-readable counterpart to the README limitations section, so a future
+    # features/labels/backtest layer can programmatically check e.g.
+    # "is this price data survivorship-safe?" instead of relying on humans
+    # having read the docs.
+    """
+    CREATE TABLE IF NOT EXISTS dataset_metadata (
+        dataset_name    TEXT NOT NULL,
+        metadata_key    TEXT NOT NULL,
+        metadata_value  TEXT NOT NULL,
+        updated_at      TIMESTAMP NOT NULL,
+        PRIMARY KEY (dataset_name, metadata_key)
+    )
+    """,
 ]
 
 _INDEXES: list[str] = [

@@ -20,9 +20,9 @@ _PRICE_PROVIDERS: dict[str, type[PriceProvider]] = {
 }
 
 
-def get_price_provider(name: str, settings: Settings) -> PriceProvider:
+def get_price_provider_class(name: str) -> type[PriceProvider]:
     try:
-        cls = _PRICE_PROVIDERS[name]
+        return _PRICE_PROVIDERS[name]
     except KeyError as exc:
         available = ", ".join(sorted(_PRICE_PROVIDERS))
         raise ValueError(
@@ -30,4 +30,8 @@ def get_price_provider(name: str, settings: Settings) -> PriceProvider:
             "Implement a new app.providers.base.PriceProvider subclass and "
             "register it in app/providers/registry.py to add another one."
         ) from exc
+
+
+def get_price_provider(name: str, settings: Settings) -> PriceProvider:
+    cls = get_price_provider_class(name)
     return cls(settings)

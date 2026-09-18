@@ -50,6 +50,19 @@ class Settings(BaseSettings):
     # --- SEC rate limiting ---------------------------------------------------------
     sec_requests_per_second: float = Field(default=3.0, gt=0, le=10.0)
 
+    # --- market calendar -------------------------------------------------------------
+    market_calendar: str = Field(default="XNYS", description="exchange_calendars calendar code.")
+    market_data_grace_minutes: int = Field(
+        default=120,
+        ge=0,
+        description="Minutes after market close before today's session is assumed to have "
+        "provider EOD data available.",
+    )
+
+    # --- Parquet partition health / compaction thresholds --------------------------
+    compact_file_count_threshold: int = Field(default=25, ge=1)
+    compact_avg_file_size_mb: float = Field(default=8.0, gt=0)
+
     # --- data directories -----------------------------------------------------------
     data_root: Path = Field(default=Path("./data"))
     raw_dir: Path = Field(default=Path("./data/raw"))

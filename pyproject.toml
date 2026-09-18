@@ -17,6 +17,7 @@ dependencies = [
     "tenacity>=9.0.0",
     "yfinance>=0.2.43",
     "python-dateutil>=2.9.0",
+    "exchange-calendars>=4.5.5",
 ]
 
 [project.optional-dependencies]
