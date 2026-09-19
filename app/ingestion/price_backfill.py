@@ -17,6 +17,7 @@ from datetime import date
 
 import duckdb
 
+from app.config.lake_datasets import get_lake_dataset
 from app.config.settings import Settings
 from app.ingestion.checkpoint import CheckpointStore, make_job_key
 from app.normalization.corporate_actions import derive_corporate_actions
@@ -26,7 +27,6 @@ from app.providers.registry import get_price_provider
 from app.services.manifest_service import finish_run, record_source_file, start_run
 from app.services.tracked_universe_service import get_tracked_price_security_ids
 from app.utils.logging import get_logger
-from app.utils.parquet_io import LakeDataset
 
 logger = get_logger("price_backfill")
 
@@ -180,13 +180,8 @@ def run_price_ingestion(
             len(pending),
         )
 
-    lake = LakeDataset(settings.prices_daily_dir, "date", ["security_id", "date"], ["security_id", "date"])
-    corp_actions_lake = LakeDataset(
-        settings.corporate_actions_dir,
-        "effective_date",
-        ["security_id", "effective_date", "action_type"],
-        ["security_id", "effective_date"],
-    )
+    lake = get_lake_dataset(settings.lake_dir, "prices_daily")
+    corp_actions_lake = get_lake_dataset(settings.lake_dir, "corporate_actions")
     run_id = start_run(con, settings.price_provider, "prices_daily", params)
 
     rows_written = 0

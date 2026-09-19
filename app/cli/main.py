@@ -322,11 +322,18 @@ def compact_macro_cmd(
 
 @compact_app.command("volatility")
 def compact_volatility_cmd(
-    year: int | None = typer.Option(None, "--year"),
-    month: int | None = typer.Option(None, "--month"),
+    year: int | None = typer.Option(None, "--year", help="Yearly-partitioned dataset -- no --month."),
     dry_run: bool = typer.Option(False, "--dry-run"),
 ) -> None:
-    _compact_generic("volatility", year, month, dry_run)
+    _compact_generic("volatility", year, None, dry_run)
+
+
+@compact_app.command("corporate-actions")
+def compact_corporate_actions_cmd(
+    year: int | None = typer.Option(None, "--year", help="Yearly-partitioned dataset -- no --month."),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+) -> None:
+    _compact_generic("corporate_actions", year, None, dry_run)
 
 
 @compact_app.command("filings")
@@ -352,13 +359,91 @@ def _compact_generic(name: str, year: int | None, month: int | None, dry_run: bo
     table.add_column("Rows after", justify="right")
     for r in results:
         table.add_row(
-            f"{r.partition[0]:04d}-{r.partition[1]:02d}",
+            r.partition.label(),
             str(r.files_before),
             str(r.files_after),
             str(r.rows_before) if r.rows_before >= 0 else "?",
             str(r.rows_after) if r.rows_after >= 0 else "?",
         )
     console.print(table)
+
+
+@app.command("migrate-partitions")
+def migrate_partitions_cmd(
+    dataset: str | None = typer.Option(
+        None, "--dataset", help="Limit to one dataset (e.g. corporate_actions, volatility). Omit for all pending."
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Report what would change without writing anything."),
+) -> None:
+    """Migrate a dataset's on-disk partitioning to match its configured granularity.
+
+    Currently relevant for 'corporate_actions' and 'volatility', which moved
+    from monthly (year=YYYY/month=MM/) to yearly (year=YYYY/) partitioning.
+    Existing data is never deleted: rows are read, deduplicated, and
+    rewritten into new yearly files in a staging area, validated (row count
+    + date range must exactly match), and only then atomically swapped in --
+    the pre-migration directory is kept as a timestamped backup for manual
+    rollback.
+    """
+    from app.config.lake_datasets import LAKE_DATASET_SPECS, resolve_dataset_key
+    from app.services.repartition_service import pending_yearly_migrations, repartition_to_yearly
+
+    settings = _bootstrap()
+
+    if dataset:
+        targets = [resolve_dataset_key(dataset)]
+    else:
+        targets = pending_yearly_migrations(settings)
+
+    if not targets:
+        console.print("[green]Nothing to migrate -- every dataset's on-disk layout already matches its configured partition policy.[/green]")
+        return
+
+    table = Table(title="Partition migration" + (" (dry-run)" if dry_run else ""))
+    table.add_column("Dataset")
+    table.add_column("Files before", justify="right")
+    table.add_column("Files after", justify="right")
+    table.add_column("Rows before", justify="right")
+    table.add_column("Rows after", justify="right")
+    table.add_column("Date range")
+    table.add_column("Time (s)", justify="right")
+    table.add_column("Backup / note")
+
+    for key in targets:
+        spec = LAKE_DATASET_SPECS[key]
+        if spec.granularity != "year":
+            console.print(f"[yellow]Skipping '{key}': not configured for yearly partitions.[/yellow]")
+            continue
+        try:
+            result = repartition_to_yearly(settings, key, dry_run=dry_run)
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"[bold red]Migration FAILED for '{key}':[/bold red] {exc}")
+            logger.exception("migrate-partitions failed for %s", key)
+            continue
+
+        if result.skipped_reason:
+            table.add_row(key, "-", "-", "-", "-", "-", "-", result.skipped_reason)
+            continue
+
+        date_range = f"{result.min_date_after}..{result.max_date_after}"
+        note = "[dim](dry-run, nothing written)[/dim]" if result.dry_run else str(result.backup_dir)
+        table.add_row(
+            key,
+            str(result.files_before),
+            str(result.files_after),
+            str(result.rows_before),
+            str(result.rows_after),
+            date_range,
+            f"{result.elapsed_seconds:.2f}",
+            note,
+        )
+
+    console.print(table)
+    if not dry_run:
+        console.print(
+            "[dim]Pre-migration data is kept in the '*__pre_yearly_backup_*' directories above -- "
+            "verify with 'stockdb storage-health' / 'stockdb status', then delete them manually once satisfied.[/dim]"
+        )
 
 
 # --------------------------------------------------------------------------- universe
@@ -454,10 +539,42 @@ def universe_remove_cmd(symbols: list[str] = typer.Argument(..., help="Tickers t
 def storage_health_cmd(
     dataset: str | None = typer.Option(None, "--dataset", help="Limit to one dataset (prices, macro, volatility, filings, ...)."),
 ) -> None:
-    """Show Parquet partition file counts/sizes and flag compaction candidates."""
-    settings = _bootstrap()
-    partitions = get_storage_health(settings, [dataset] if dataset else None)
+    """Show Parquet partition file counts/sizes, per-dataset partition policy, and compaction candidates."""
+    from app.config.lake_datasets import resolve_dataset_key
+    from app.services.storage_health_service import get_dataset_policies
 
+    settings = _bootstrap()
+    dataset_key = resolve_dataset_key(dataset) if dataset else None
+
+    policy_table = Table(title="Partition policy")
+    policy_table.add_column("Dataset")
+    policy_table.add_column("Granularity")
+    policy_table.add_column("File-count threshold", justify="right")
+    policy_table.add_column("Avg-size threshold", justify="right")
+    policy_table.add_column("On disk")
+    policy_table.add_column("Status")
+    for pol in get_dataset_policies(settings):
+        if dataset_key and pol.dataset != dataset_key:
+            continue
+        if not pol.implemented:
+            status = "[dim]not implemented yet[/dim]"
+        elif pol.on_disk_granularity is None:
+            status = "[dim]no data yet[/dim]"
+        elif pol.migration_pending:
+            status = f"[red]MIGRATION PENDING[/red] (on disk: {pol.on_disk_granularity})"
+        else:
+            status = "[green]OK[/green]"
+        policy_table.add_row(
+            pol.dataset,
+            pol.granularity,
+            str(pol.file_count_threshold),
+            f"{pol.avg_file_size_mb_threshold:.1f}MB",
+            pol.on_disk_granularity or "-",
+            status,
+        )
+    console.print(policy_table)
+
+    partitions = get_storage_health(settings, [dataset_key] if dataset_key else None)
     if not partitions:
         console.print("[yellow]No Parquet partitions found yet.[/yellow]")
         return
@@ -471,10 +588,10 @@ def storage_health_cmd(
     table.add_column("Avg file size", justify="right")
     table.add_column("Newest file")
     table.add_column("Compact?")
-    for p in sorted(partitions, key=lambda x: (x.dataset, x.year, x.month)):
+    for p in sorted(partitions, key=lambda x: (x.dataset, x.partition.year, x.partition.month or 0)):
         table.add_row(
             p.dataset,
-            f"{p.year:04d}-{p.month:02d}",
+            p.partition.label(),
             str(p.file_count),
             _human_bytes(p.total_size_bytes),
             str(p.row_count_estimate),
@@ -487,7 +604,8 @@ def storage_health_cmd(
     if candidates:
         console.print(
             f"[yellow]{len(candidates)} partition(s) look like good compaction candidates.[/yellow] "
-            f"Run e.g. 'stockdb compact prices --year YYYY --month MM' to merge them "
+            f"Run e.g. 'stockdb compact prices --year YYYY --month MM' (monthly datasets) or "
+            f"'stockdb compact volatility --year YYYY' (yearly datasets) to merge them "
             f"(compaction is never automatic in the daily pipeline)."
         )
 

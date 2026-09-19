@@ -14,8 +14,8 @@ from datetime import UTC, datetime
 import duckdb
 import polars as pl
 
+from app.config.lake_datasets import get_lake_dataset
 from app.config.settings import Settings
-from app.utils.parquet_io import LakeDataset
 
 
 @dataclass
@@ -204,7 +204,7 @@ def auto_register_from_existing_price_data(con: duckdb.DuckDBPyConnection, setti
     lake becomes tracked (for prices) if it is not already a tracked_securities
     row (existing rows -- including deliberately removed ones -- are never
     touched). Safe to call on every startup."""
-    ds = LakeDataset(settings.prices_daily_dir, "date", ["security_id", "date"], ["security_id", "date"])
+    ds = get_lake_dataset(settings.lake_dir, "prices_daily")
     if not ds.has_any_files():
         return 0
     glob_path = ds.glob_pattern().replace("'", "''")

@@ -27,10 +27,10 @@ def test_write_increment_creates_correct_partitions(tmp_path: Path) -> None:
 
     assert result.rows_written == 3
     assert set(result.partitions_written) == {(2024, 1), (2024, 2)}
-    assert ds.partition_dir(2024, 1).exists()
-    assert ds.partition_dir(2024, 2).exists()
-    assert len(list(ds.partition_dir(2024, 1).glob("*.parquet"))) == 1
-    assert len(list(ds.partition_dir(2024, 2).glob("*.parquet"))) == 1
+    assert ds.partition_dir(ds.make_key(2024, 1)).exists()
+    assert ds.partition_dir(ds.make_key(2024, 2)).exists()
+    assert len(list(ds.partition_dir(ds.make_key(2024, 1)).glob("*.parquet"))) == 1
+    assert len(list(ds.partition_dir(ds.make_key(2024, 2)).glob("*.parquet"))) == 1
 
 
 def test_write_increment_sorts_within_partition(tmp_path: Path) -> None:
@@ -45,7 +45,7 @@ def test_write_increment_sorts_within_partition(tmp_path: Path) -> None:
     ).with_columns(pl.col("date").str.to_date())
 
     ds.write_increment(df, run_id="run1")
-    file = next(ds.partition_dir(2024, 1).glob("*.parquet"))
+    file = next(ds.partition_dir(ds.make_key(2024, 1)).glob("*.parquet"))
     result_df = pl.read_parquet(file)
     keys = list(zip(result_df["security_id"].to_list(), result_df["date"].to_list(), strict=False))
     assert keys == sorted(keys)

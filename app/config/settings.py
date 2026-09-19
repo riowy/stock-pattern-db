@@ -60,8 +60,17 @@ class Settings(BaseSettings):
     )
 
     # --- Parquet partition health / compaction thresholds --------------------------
+    # Applied to monthly-partitioned datasets (prices_daily, features_daily,
+    # labels_forward_returns, filings, short_volume): a monthly partition
+    # naturally accumulates more files at a faster clip.
     compact_file_count_threshold: int = Field(default=25, ge=1)
     compact_avg_file_size_mb: float = Field(default=8.0, gt=0)
+
+    # Applied to yearly-partitioned datasets (volatility, corporate_actions):
+    # a lower file-count bar, since a whole year's worth of small appends
+    # sitting in one partition is worse than the monthly-dataset equivalent.
+    compact_yearly_file_count_threshold: int = Field(default=12, ge=1)
+    compact_yearly_avg_file_size_mb: float = Field(default=2.0, gt=0)
 
     # --- data directories -----------------------------------------------------------
     data_root: Path = Field(default=Path("./data"))

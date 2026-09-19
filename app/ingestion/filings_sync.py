@@ -24,13 +24,13 @@ from dataclasses import dataclass, field
 
 import duckdb
 
+from app.config.lake_datasets import get_lake_dataset
 from app.config.settings import Settings
 from app.normalization.filings import normalize_filing_rows
 from app.providers.filings.sec_filings_provider import SecFilingsProvider
 from app.services.manifest_service import finish_run, record_source_file, start_run
 from app.services.tracked_universe_service import get_tracked_filing_ciks
 from app.utils.logging import get_logger
-from app.utils.parquet_io import LakeDataset
 
 logger = get_logger("filings_sync")
 
@@ -95,7 +95,7 @@ def sync_filings(
         )
 
     provider = SecFilingsProvider(settings)
-    lake = LakeDataset(settings.filings_dir, "filing_date", ["accession_number"], ["security_id", "filing_date"])
+    lake = get_lake_dataset(settings.lake_dir, "filings")
     run_id = start_run(con, provider.capabilities.provider_name, "filings", {"cik_count": len(targets)})
 
     successful = 0

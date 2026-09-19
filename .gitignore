@@ -33,3 +33,7 @@ data/logs/*.log*
 
 # OS
 .DS_Store
+
+# Local repartition/migration backups
+data/lake/*_backup_*/
+data/lake/*_backup_*

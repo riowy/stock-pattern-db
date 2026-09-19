@@ -6,12 +6,12 @@ from dataclasses import dataclass
 
 import duckdb
 
+from app.config.lake_datasets import get_lake_dataset
 from app.config.settings import Settings
 from app.normalization.vix import normalize_vix_rows
 from app.providers.volatility.cboe_vix_provider import CboeVixProvider
 from app.services.manifest_service import finish_run, record_source_file, start_run
 from app.utils.logging import get_logger
-from app.utils.parquet_io import LakeDataset
 
 logger = get_logger("vix_sync")
 
@@ -32,7 +32,7 @@ def sync_vix(settings: Settings, con: duckdb.DuckDBPyConnection, dry_run: bool =
         return VixSyncResult(run_id=None, rows_written=0, status="planned", dry_run=True)
 
     provider = CboeVixProvider(settings)
-    lake = LakeDataset(settings.volatility_dir, "date", ["date"], ["date"])
+    lake = get_lake_dataset(settings.lake_dir, "volatility")
     run_id = start_run(con, provider.capabilities.provider_name, "volatility", {})
 
     try:

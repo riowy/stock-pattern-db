@@ -8,6 +8,7 @@ from pathlib import Path
 
 import duckdb
 
+from app.config.lake_datasets import get_lake_dataset
 from app.config.settings import Settings
 from app.db.schema import create_lake_views
 from app.ingestion.checkpoint import CheckpointStore
@@ -15,7 +16,6 @@ from app.services.dataset_metadata_service import PRICES_DAILY_DATASET, get_meta
 from app.services.market_calendar import MarketCalendarService
 from app.services.storage_health_service import compaction_candidates
 from app.services.tracked_universe_service import get_tracked_price_security_ids
-from app.utils.parquet_io import LakeDataset
 
 
 @dataclass
@@ -132,7 +132,7 @@ def gather_status(settings: Settings, con: duckdb.DuckDBPyConnection) -> StatusR
     )
 
     tracked_price_ids = get_tracked_price_security_ids(con)
-    prices_ds = LakeDataset(settings.prices_daily_dir, "date", ["security_id", "date"], ["security_id", "date"])
+    prices_ds = get_lake_dataset(settings.lake_dir, "prices_daily")
     calendar = MarketCalendarService(settings.market_calendar, settings.market_data_grace_minutes)
 
     if prices_ds.has_any_files():
@@ -164,7 +164,7 @@ def gather_status(settings: Settings, con: duckdb.DuckDBPyConnection) -> StatusR
     else:
         prices = PricesStatus(tracked_no_data=len(tracked_price_ids))
 
-    macro_ds = LakeDataset(settings.macro_dir, "date", ["series_id", "date"], ["series_id", "date"])
+    macro_ds = get_lake_dataset(settings.lake_dir, "macro")
     if macro_ds.has_any_files():
         series_count, last_update = con.execute(
             "SELECT count(DISTINCT series_id), max(retrieved_at) FROM macro"
@@ -177,7 +177,7 @@ def gather_status(settings: Settings, con: duckdb.DuckDBPyConnection) -> StatusR
     else:
         macro = MacroStatus(fred_configured=bool(settings.fred_api_key.strip()))
 
-    vix_ds = LakeDataset(settings.volatility_dir, "date", ["date"], ["date"])
+    vix_ds = get_lake_dataset(settings.lake_dir, "volatility")
     if vix_ds.has_any_files():
         rows, latest = con.execute("SELECT count(*), max(date) FROM volatility").fetchone()
         vix = VixStatus(rows=rows or 0, latest_date=str(latest) if latest else None)
@@ -191,9 +191,7 @@ def gather_status(settings: Settings, con: duckdb.DuckDBPyConnection) -> StatusR
         WHERE t.enabled = TRUE AND t.filings_tracking = TRUE AND s.cik IS NOT NULL
         """
     ).fetchone()[0]
-    filings_ds = LakeDataset(
-        settings.filings_dir, "filing_date", ["accession_number"], ["security_id", "filing_date"]
-    )
+    filings_ds = get_lake_dataset(settings.lake_dir, "filings")
     if filings_ds.has_any_files():
         count, last_retrieved = con.execute("SELECT count(*), max(retrieved_at) FROM filings").fetchone()
         sec = SecStatus(
@@ -210,7 +208,7 @@ def gather_status(settings: Settings, con: duckdb.DuckDBPyConnection) -> StatusR
         lake_bytes=_dir_size(settings.lake_dir),
         state_bytes=_dir_size(settings.state_dir),
         compaction_candidate_count=len(candidates),
-        compaction_candidate_labels=[f"{c.dataset} {c.year:04d}-{c.month:02d} ({c.file_count} files)" for c in candidates[:5]],
+        compaction_candidate_labels=[f"{c.dataset} {c.partition.label()} ({c.file_count} files)" for c in candidates[:5]],
     )
 
     last_success_row = con.execute(

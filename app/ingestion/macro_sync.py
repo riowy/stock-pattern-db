@@ -8,12 +8,12 @@ from datetime import date
 import duckdb
 
 from app.config.fred_series import FRED_SEED_SERIES
+from app.config.lake_datasets import get_lake_dataset
 from app.config.settings import Settings
 from app.normalization.macro import normalize_macro_rows
 from app.providers.macro.fred_provider import FredMacroProvider
 from app.services.manifest_service import finish_run, record_source_file, start_run
 from app.utils.logging import get_logger
-from app.utils.parquet_io import LakeDataset
 
 logger = get_logger("macro_sync")
 
@@ -60,7 +60,7 @@ def sync_macro(
         )
 
     provider = FredMacroProvider(settings)
-    lake = LakeDataset(settings.macro_dir, "date", ["series_id", "date"], ["series_id", "date"])
+    lake = get_lake_dataset(settings.lake_dir, "macro")
 
     run_id = start_run(
         con, provider.capabilities.provider_name, "macro", {"series_ids": targets, "start": str(start)}

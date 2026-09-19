@@ -184,9 +184,9 @@ def validate_prices(
 ) -> ValidationSummary:
     create_lake_views(con, settings)
 
-    from app.utils.parquet_io import LakeDataset
+    from app.config.lake_datasets import get_lake_dataset
 
-    prices_dataset = LakeDataset(settings.prices_daily_dir, "date", ["security_id", "date"], ["security_id", "date"])
+    prices_dataset = get_lake_dataset(settings.lake_dir, "prices_daily")
     tracked_ids = get_tracked_price_security_ids(con)
 
     if not prices_dataset.has_any_files():

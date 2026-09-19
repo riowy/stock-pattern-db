@@ -161,29 +161,10 @@ def create_lake_views(con: duckdb.DuckDBPyConnection, settings) -> None:  # noqa
     re-ingestion runs. Views are skipped (not created) for datasets that have
     no Parquet files yet.
     """
-    from app.utils.parquet_io import LakeDataset
+    from app.config.lake_datasets import get_lake_dataset, implemented_dataset_keys
 
-    datasets: dict[str, LakeDataset] = {
-        "prices_daily": LakeDataset(
-            settings.prices_daily_dir, "date", ["security_id", "date"], ["security_id", "date"]
-        ),
-        "corporate_actions": LakeDataset(
-            settings.corporate_actions_dir,
-            "effective_date",
-            ["security_id", "effective_date", "action_type"],
-            ["security_id", "effective_date"],
-        ),
-        "macro": LakeDataset(settings.macro_dir, "date", ["series_id", "date"], ["series_id", "date"]),
-        "volatility": LakeDataset(settings.volatility_dir, "date", ["date"], ["date"]),
-        "filings": LakeDataset(
-            settings.filings_dir, "filing_date", ["accession_number"], ["security_id", "filing_date"]
-        ),
-        "short_volume": LakeDataset(
-            settings.short_volume_dir, "date", ["security_id", "date"], ["security_id", "date"]
-        ),
-    }
-
-    for name, ds in datasets.items():
+    for name in implemented_dataset_keys():
+        ds = get_lake_dataset(settings.lake_dir, name)
         if not ds.has_any_files():
             continue
         glob_path = ds.glob_pattern().replace("'", "''")
