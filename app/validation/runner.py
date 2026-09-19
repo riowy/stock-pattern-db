@@ -277,3 +277,89 @@ def validate_prices(
         scope_size=len(scope_ids),
         resolved_stale_issues=resolved_count,
     )
+
+
+def _validate_computed_dataset(
+    settings: Settings,
+    con: duckdb.DuckDBPyConnection,
+    dataset: str,
+    symbols: list[str] | None,
+    dry_run: bool,
+    rule_fn,  # noqa: ANN001
+) -> ValidationSummary:
+    create_lake_views(con, settings)
+    from app.config.lake_datasets import get_lake_dataset
+    from app.services.tracked_universe_service import get_tracked_feature_security_ids
+
+    ds = get_lake_dataset(settings.lake_dir, dataset)
+    tracked_ids = get_tracked_feature_security_ids(con)
+    if not ds.has_any_files():
+        return ValidationSummary(dataset, 0, 0, scope="tracked", scope_size=len(tracked_ids))
+
+    if symbols:
+        scope_label = "explicit_symbols"
+        placeholders = ", ".join("?" for _ in symbols)
+        ticker_col = "ticker_at_time"
+        df = con.execute(
+            f"SELECT * FROM {dataset} WHERE {ticker_col} IN ({placeholders})",
+            [s.upper() for s in symbols],
+        ).pl()
+        scope_ids = df.select("security_id").unique().to_series().to_list() if df.height else []
+    else:
+        scope_label = "tracked"
+        scope_ids = tracked_ids
+        if not scope_ids:
+            return ValidationSummary(dataset, 0, 0, scope=scope_label, scope_size=0)
+        placeholders = ", ".join("?" for _ in scope_ids)
+        df = con.execute(f"SELECT * FROM {dataset} WHERE security_id IN ({placeholders})", scope_ids).pl()
+
+    if df.height == 0:
+        return ValidationSummary(dataset, 0, 0, scope=scope_label, scope_size=len(scope_ids))
+
+    all_issues = rule_fn(df)
+    critical = sum(1 for i in all_issues if i["severity"] == "critical")
+    warning = sum(1 for i in all_issues if i["severity"] == "warning")
+    info = sum(1 for i in all_issues if i["severity"] == "info")
+    by_type: dict[str, int] = {}
+    for i in all_issues:
+        by_type[i["issue_type"]] = by_type.get(i["issue_type"], 0) + 1
+
+    resolved_count = 0
+    if not dry_run:
+        still_open_ids = _persist_issues(con, dataset, all_issues)
+        resolved_count += _resolve_stale_issues_in_scope(con, dataset, scope_ids, still_open_ids)
+
+    return ValidationSummary(
+        dataset=dataset,
+        rows_checked=df.height,
+        issues_found=len(all_issues),
+        critical=critical,
+        warning=warning,
+        info=info,
+        by_type=by_type,
+        scope=scope_label,
+        scope_size=len(scope_ids),
+        resolved_stale_issues=resolved_count,
+    )
+
+
+def validate_features(
+    settings: Settings,
+    con: duckdb.DuckDBPyConnection,
+    symbols: list[str] | None = None,
+    dry_run: bool = False,
+) -> ValidationSummary:
+    from app.validation.feature_rules import run_feature_rules
+
+    return _validate_computed_dataset(settings, con, "features_daily", symbols, dry_run, run_feature_rules)
+
+
+def validate_labels(
+    settings: Settings,
+    con: duckdb.DuckDBPyConnection,
+    symbols: list[str] | None = None,
+    dry_run: bool = False,
+) -> ValidationSummary:
+    from app.validation.label_rules import run_label_rules
+
+    return _validate_computed_dataset(settings, con, "labels_forward_returns", symbols, dry_run, run_label_rules)

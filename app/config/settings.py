@@ -42,8 +42,12 @@ class Settings(BaseSettings):
     price_provider: str = Field(default="yfinance")
 
     # --- resource limits ---------------------------------------------------------
-    max_workers: int = Field(default=4, ge=1, le=32)
-    price_batch_size: int = Field(default=50, ge=1, le=1000)
+    max_workers: int = Field(default=2, ge=1, le=32)
+    price_batch_size: int = Field(default=25, ge=1, le=1000)
+    feature_batch_size: int = Field(default=50, ge=1, le=1000)
+    max_feature_lookback_sessions: int = Field(default=300, ge=50, le=2000)
+    label_recompute_sessions: int = Field(default=30, ge=20, le=120)
+    price_request_pause_seconds: float = Field(default=0.0, ge=0, le=10)
     duckdb_threads: int = Field(default=6, ge=1, le=64)
     duckdb_memory_limit: str = Field(default="24GB")
 
@@ -121,6 +125,14 @@ class Settings(BaseSettings):
     def short_volume_dir(self) -> Path:
         return self.lake_dir / "short_volume"
 
+    @property
+    def features_daily_dir(self) -> Path:
+        return self.lake_dir / "features_daily"
+
+    @property
+    def labels_forward_returns_dir(self) -> Path:
+        return self.lake_dir / "labels_forward_returns"
+
     def ensure_directories(self) -> None:
         """Create the standard directory skeleton if it does not exist yet."""
         for path in (
@@ -135,6 +147,8 @@ class Settings(BaseSettings):
             self.volatility_dir,
             self.filings_dir,
             self.short_volume_dir,
+            self.features_daily_dir,
+            self.labels_forward_returns_dir,
             self.state_dir,
             self.checkpoints_dir,
             self.log_dir,

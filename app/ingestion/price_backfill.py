@@ -12,6 +12,7 @@ partition file is ever left half-written (see ``LakeDataset.write_increment``).
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from datetime import date
 
@@ -245,6 +246,8 @@ def run_price_ingestion(
                     failed += 1
                     failures.append(SymbolFailure(canonical, str(exc)))
                     state.setdefault("failed", []).append({"symbol": canonical, "error": str(exc)})
+                if settings.price_request_pause_seconds:
+                    time.sleep(settings.price_request_pause_seconds)
 
             pending = pending[len(batch):]
             state["completed"] = state.get("completed", [])

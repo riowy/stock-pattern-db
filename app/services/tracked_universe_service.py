@@ -153,6 +153,32 @@ def remove_tracked(con: duckdb.DuckDBPyConnection, security_ids: list[str]) -> i
     ).fetchone()[0]
 
 
+def get_tracked_feature_security_ids(con: duckdb.DuckDBPyConnection) -> list[str]:
+    rows = con.execute(
+        "SELECT security_id FROM tracked_securities "
+        "WHERE enabled = TRUE AND feature_tracking = TRUE ORDER BY security_id"
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
+def enable_feature_tracking_for_price_tracked(con: duckdb.DuckDBPyConnection) -> int:
+    """Idempotent: price-tracked enabled rows also get feature_tracking."""
+    before = con.execute(
+        "SELECT count(*) FROM tracked_securities "
+        "WHERE enabled = TRUE AND price_tracking = TRUE AND feature_tracking = FALSE"
+    ).fetchone()[0]
+    if not before:
+        return 0
+    con.execute(
+        """
+        UPDATE tracked_securities
+        SET feature_tracking = TRUE
+        WHERE enabled = TRUE AND price_tracking = TRUE AND feature_tracking = FALSE
+        """
+    )
+    return before
+
+
 def get_tracked_price_security_ids(con: duckdb.DuckDBPyConnection) -> list[str]:
     rows = con.execute(
         "SELECT security_id FROM tracked_securities WHERE enabled = TRUE AND price_tracking = TRUE ORDER BY security_id"

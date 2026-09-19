@@ -119,22 +119,36 @@ def sync_universe_cmd(dry_run: bool = typer.Option(False, "--dry-run", help="Pre
 
 @app.command("backfill-prices")
 def backfill_prices_cmd(
-    symbols: str | None = typer.Option(None, "--symbols", help="Comma-separated canonical tickers. Omit for ALL active securities (explicit full backfill)."),
+    symbols: str | None = typer.Option(None, "--symbols", help="Comma-separated canonical tickers."),
     start: str = typer.Option(..., "--start", help="Start date YYYY-MM-DD."),
     end: str | None = typer.Option(None, "--end", help="End date YYYY-MM-DD (default: latest available)."),
     batch_size: int | None = typer.Option(None, "--batch-size", help="Symbols per batch (default from settings)."),
     resume: bool = typer.Option(False, "--resume", help="Resume from the last checkpoint for this exact job."),
+    tracked: bool = typer.Option(False, "--tracked", help="Target the tracked price universe."),
+    all_active: bool = typer.Option(
+        False, "--all-active", help="Target every active security (explicit full-universe backfill)."
+    ),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview without fetching/writing."),
 ) -> None:
     """Backfill daily price history for one or many symbols, with checkpoint/resume.
 
-    Omitting --symbols targets every *active* security in the security
-    master (the deliberate 10 -> 100 -> 500 -> full universe expansion
-    path) -- not the small tracked universe. Use 'stockdb universe add' to
-    grow the tracked universe once you're happy with a symbol's data.
+    Pass --symbols, --tracked, or --all-active. Omitting all three still
+    defaults to --all-active for backwards compatibility, but that path is
+    never started automatically -- use --dry-run first.
     """
     settings = _bootstrap()
     from app.ingestion.price_backfill import run_price_ingestion
+    from app.ingestion.research_universe import estimate_price_backfill
+
+    if tracked and all_active:
+        console.print("[red]Pass only one of --tracked or --all-active.[/red]")
+        raise typer.Exit(1)
+    if symbols:
+        default_scope = "tracked"
+    elif tracked:
+        default_scope = "tracked"
+    else:
+        default_scope = "all_active"
 
     try:
         with duckdb_connection(settings) as con:
@@ -149,7 +163,7 @@ def backfill_prices_cmd(
                     batch_size=batch_size or settings.price_batch_size,
                     resume=resume,
                     dry_run=dry_run,
-                    default_scope="all_active",
+                    default_scope=default_scope,
                 )
             except ProviderNotAllowedError as exc:
                 console.print(f"[bold red]{exc}[/bold red]")
@@ -159,7 +173,13 @@ def backfill_prices_cmd(
         raise typer.Exit(1) from exc
 
     if result.dry_run:
+        est = estimate_price_backfill(result.total_symbols, _parse_date(start), _parse_date(end))
         console.print(f"[bold]\\[dry-run][/bold] would backfill {result.total_symbols} symbol(s). No requests made.")
+        console.print(
+            f"  Estimated requests: {est['estimated_requests']}  "
+            f"Estimated rows (upper bound): {est['estimated_rows']}  "
+            f"Estimated disk: {_human_bytes(est['estimated_disk_bytes'])}"
+        )
         return
 
     console.print(
@@ -269,6 +289,162 @@ def sync_sec_filings_cmd(
     )
 
 
+def _print_compute_plan(title: str, result) -> None:  # noqa: ANN001
+    plan = result.plan
+    console.print(f"[bold]{title}[/bold]")
+    if plan is None:
+        console.print(f"  Symbols: {result.total_symbols}")
+        console.print("  No writes performed.")
+        return
+    console.print(f"  Tracked securities: {plan.targets}")
+    console.print(f"  Start: {plan.start}")
+    console.print(f"  End: {plan.end or 'latest available'}")
+    console.print(f"  Version: {plan.version}")
+    if plan.lookback_sessions:
+        console.print(f"  Lookback: {plan.lookback_sessions} sessions")
+    if plan.lookahead_sessions:
+        console.print(f"  Lookahead: {plan.lookahead_sessions} sessions")
+    console.print(f"  Estimated partitions: {plan.estimated_partitions}")
+    console.print("  No writes performed.")
+
+
+@app.command("compute-features")
+def compute_features_cmd(
+    symbols: str | None = typer.Option(None, "--symbols", help="Comma-separated tickers. Omit for feature_tracking universe."),
+    start: str = typer.Option(..., "--start", help="Start date YYYY-MM-DD."),
+    end: str | None = typer.Option(None, "--end", help="End date YYYY-MM-DD."),
+    version: str = typer.Option("v1", "--version", help="feature_version."),
+    resume: bool = typer.Option(False, "--resume"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+) -> None:
+    """Compute features_daily for the feature-tracking universe (never the full 10k master)."""
+    settings = _bootstrap()
+    from app.ingestion.feature_compute import compute_features
+
+    with duckdb_connection(settings) as con:
+        _prepare_db(con, settings, dry_run=dry_run)
+        try:
+            result = compute_features(
+                settings,
+                con,
+                _parse_symbols(symbols),
+                _parse_date(start),
+                _parse_date(end),
+                version=version,
+                resume=resume,
+                dry_run=dry_run,
+            )
+        except ValueError as exc:
+            console.print(f"[bold red]{exc}[/bold red]")
+            raise typer.Exit(1) from exc
+    if result.dry_run:
+        _print_compute_plan("Feature computation plan", result)
+        return
+    console.print(
+        f"[bold green]Feature compute complete[/bold green]: {result.successful}/{result.total_symbols} "
+        f"succeeded, {result.rows_written} rows written."
+    )
+
+
+@app.command("compute-labels")
+def compute_labels_cmd(
+    symbols: str | None = typer.Option(None, "--symbols", help="Comma-separated tickers. Omit for feature_tracking universe."),
+    start: str = typer.Option(..., "--start", help="Start date YYYY-MM-DD."),
+    end: str | None = typer.Option(None, "--end", help="End date YYYY-MM-DD."),
+    version: str = typer.Option("v1", "--version", help="label_version."),
+    resume: bool = typer.Option(False, "--resume"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+) -> None:
+    """Compute labels_forward_returns for the feature-tracking universe."""
+    settings = _bootstrap()
+    from app.ingestion.label_compute import compute_labels
+
+    with duckdb_connection(settings) as con:
+        _prepare_db(con, settings, dry_run=dry_run)
+        try:
+            result = compute_labels(
+                settings,
+                con,
+                _parse_symbols(symbols),
+                _parse_date(start),
+                _parse_date(end),
+                version=version,
+                resume=resume,
+                dry_run=dry_run,
+            )
+        except ValueError as exc:
+            console.print(f"[bold red]{exc}[/bold red]")
+            raise typer.Exit(1) from exc
+    if result.dry_run:
+        _print_compute_plan("Label computation plan", result)
+        return
+    console.print(
+        f"[bold green]Label compute complete[/bold green]: {result.successful}/{result.total_symbols} "
+        f"succeeded, {result.rows_written} rows written."
+    )
+
+
+@app.command("expand-universe")
+def expand_universe_cmd(
+    research_scale: int | None = typer.Option(None, "--research-scale", help="Deterministic scale-test size, e.g. 100 or 500."),
+    all_active: bool = typer.Option(False, "--all-active", help="Register every active security as tracked."),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+) -> None:
+    """Grow the tracked/research-scale universe. Never starts a full-history backfill."""
+    settings = _bootstrap()
+    from app.ingestion.research_universe import (
+        all_active_tickers,
+        apply_research_scale_universe,
+        build_research_scale_universe,
+        estimate_price_backfill,
+    )
+    from app.services.tracked_universe_service import add_tracked
+
+    if research_scale and all_active:
+        console.print("[red]Pass only one of --research-scale or --all-active.[/red]")
+        raise typer.Exit(1)
+    if not research_scale and not all_active:
+        console.print("[red]Pass --research-scale N or --all-active.[/red]")
+        raise typer.Exit(1)
+
+    with duckdb_connection(settings) as con:
+        _prepare_db(con, settings, dry_run=dry_run)
+        if research_scale:
+            plan = build_research_scale_universe(con, research_scale)
+            apply_research_scale_universe(con, plan, dry_run=dry_run)
+            label = "[dry-run] would register" if dry_run else "Registered"
+            console.print(
+                f"[bold green]{label}[/bold green] {plan.name}: {plan.size} securities "
+                f"(scale-test universe, not an investment universe)."
+            )
+            console.print(f"  Criteria: {plan.criteria}")
+            console.print(f"  Sample: {', '.join(plan.tickers[:15])}{'...' if plan.size > 15 else ''}")
+            return
+
+        pairs = all_active_tickers(con)
+        est = estimate_price_backfill(len(pairs), date(2000, 1, 1))
+        console.print(f"Active universe: {len(pairs)} symbols")
+        console.print(
+            f"  Full-history backfill estimate from 2000-01-01: "
+            f"{est['estimated_requests']} requests, {est['estimated_rows']} rows (upper bound), "
+            f"{_human_bytes(est['estimated_disk_bytes'])} disk"
+        )
+        if dry_run:
+            console.print("[bold]\\[dry-run][/bold] would add them to tracked_securities. No writes performed.")
+            return
+        add_tracked(
+            con,
+            [sid for _, sid in pairs],
+            reason="all-active",
+            price_tracking=True,
+            filings_tracking=False,
+            feature_tracking=True,
+            notes="explicit expand-universe --all-active",
+        )
+        console.print(f"[bold green]Added {len(pairs)} active securities to the tracked universe.[/bold green]")
+        console.print("[yellow]This does NOT start a price backfill. Run backfill-prices --tracked --dry-run first.[/yellow]")
+
+
 @validate_app.command("prices")
 def validate_prices_cmd(
     symbols: str | None = typer.Option(None, "--symbols"),
@@ -299,6 +475,44 @@ def validate_prices_cmd(
         for k, v in sorted(summary.by_type.items(), key=lambda kv: -kv[1]):
             table.add_row(k, str(v))
         console.print(table)
+
+
+@validate_app.command("features")
+def validate_features_cmd(
+    symbols: str | None = typer.Option(None, "--symbols"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+) -> None:
+    """Run data-quality checks over features_daily."""
+    settings = _bootstrap()
+    from app.validation.runner import validate_features
+
+    with duckdb_connection(settings) as con:
+        _prepare_db(con, settings, dry_run=dry_run)
+        summary = validate_features(settings, con, _parse_symbols(symbols), dry_run)
+    console.print(
+        f"[bold]Validation[/bold] ({summary.dataset}, scope={summary.scope}, {summary.scope_size} securities): "
+        f"{summary.rows_checked} rows checked, {summary.issues_found} issues found "
+        f"([red]{summary.critical} critical[/red], [yellow]{summary.warning} warning[/yellow], {summary.info} info)"
+    )
+
+
+@validate_app.command("labels")
+def validate_labels_cmd(
+    symbols: str | None = typer.Option(None, "--symbols"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+) -> None:
+    """Run data-quality checks over labels_forward_returns."""
+    settings = _bootstrap()
+    from app.validation.runner import validate_labels
+
+    with duckdb_connection(settings) as con:
+        _prepare_db(con, settings, dry_run=dry_run)
+        summary = validate_labels(settings, con, _parse_symbols(symbols), dry_run)
+    console.print(
+        f"[bold]Validation[/bold] ({summary.dataset}, scope={summary.scope}, {summary.scope_size} securities): "
+        f"{summary.rows_checked} rows checked, {summary.issues_found} issues found "
+        f"([red]{summary.critical} critical[/red], [yellow]{summary.warning} warning[/yellow], {summary.info} info)"
+    )
 
 
 @compact_app.command("prices")
@@ -343,6 +557,24 @@ def compact_filings_cmd(
     dry_run: bool = typer.Option(False, "--dry-run"),
 ) -> None:
     _compact_generic("filings", year, month, dry_run)
+
+
+@compact_app.command("features")
+def compact_features_cmd(
+    year: int | None = typer.Option(None, "--year"),
+    month: int | None = typer.Option(None, "--month"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+) -> None:
+    _compact_generic("features_daily", year, month, dry_run)
+
+
+@compact_app.command("labels")
+def compact_labels_cmd(
+    year: int | None = typer.Option(None, "--year"),
+    month: int | None = typer.Option(None, "--month"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+) -> None:
+    _compact_generic("labels_forward_returns", year, month, dry_run)
 
 
 def _compact_generic(name: str, year: int | None, month: int | None, dry_run: bool) -> None:
@@ -638,6 +870,32 @@ def status() -> None:
     prices_table.add_row("Tracked securities with no data", str(report.prices.tracked_no_data))
     console.print(prices_table)
 
+    feat_table = Table(title="Features")
+    feat_table.add_column("Metric")
+    feat_table.add_column("Value", justify="right")
+    feat_table.add_row("Rows", str(report.features.rows))
+    feat_table.add_row("Latest feature date", report.features.latest_date or "-")
+    feat_table.add_row("Tracked current", str(report.features.tracked_current))
+    feat_table.add_row("Tracked stale", str(report.features.tracked_stale))
+    console.print(feat_table)
+
+    lab_table = Table(title="Labels")
+    lab_table.add_column("Metric")
+    lab_table.add_column("Value", justify="right")
+    lab_table.add_row("Rows", str(report.labels.rows))
+    lab_table.add_row("Latest date", report.labels.latest_date or "-")
+    lab_table.add_row("Latest mature 20d horizon", report.labels.latest_mature_horizon or "-")
+    lab_table.add_row("Recent null expected", "yes" if report.labels.recent_null_expected else "no")
+    console.print(lab_table)
+
+    daily_table = Table(title="Daily")
+    daily_table.add_column("Metric")
+    daily_table.add_column("Value")
+    daily_table.add_row("Last successful run", report.daily.last_success or "-")
+    daily_table.add_row("Last failed run", report.daily.last_failure or "-")
+    daily_table.add_row("Failed symbols", ", ".join(report.daily.failed_symbols) or "-")
+    console.print(daily_table)
+
     macro_table = Table(title="Macro (FRED)")
     macro_table.add_column("Metric")
     macro_table.add_column("Value", justify="right")
@@ -720,108 +978,37 @@ def _human_bytes(n: int) -> str:
 
 @app.command("run-daily")
 def run_daily_cmd(dry_run: bool = typer.Option(False, "--dry-run")) -> None:
-    """Run the full daily pipeline: universe -> prices -> vix -> macro -> filings -> validate -> report.
+    """Run the daily pipeline through incremental features/labels.
 
-    Prices/filings operate on the *tracked* universe, not the full security
-    master -- see 'stockdb universe'. In --dry-run mode this makes NO
-    network requests and NO database/checkpoint/Parquet writes; it only
-    reports, from local metadata, what each step would do.
+    Order: universe -> prices -> VIX -> optional FRED -> filings ->
+    price validation -> incremental features -> recent label recompute ->
+    feature/label validation -> status. A single symbol failure does not
+    abort the job; catalog/schema/critical-validation failures do.
     """
     settings = _bootstrap()
-    from app.ingestion.filings_sync import sync_filings
-    from app.ingestion.macro_sync import sync_macro
-    from app.ingestion.price_sync import sync_recent_prices
-    from app.ingestion.universe_sync import sync_universe
-    from app.ingestion.vix_sync import sync_vix
-    from app.validation.runner import validate_prices
+    from app.ingestion.daily_pipeline import run_daily_pipeline
 
-    steps: list[tuple[str, str]] = []
     title = "Daily pipeline dry run" if dry_run else "Daily pipeline run"
     console.rule(f"[bold]{title}[/bold]")
 
     with duckdb_connection(settings) as con:
         _prepare_db(con, settings, dry_run=dry_run)
-
-        console.rule("1/6 Universe")
-        try:
-            r = sync_universe(settings, con, dry_run)
-            verb = "would sync" if r.dry_run else "synced"
-            steps.append(("universe", f"{verb} SEC universe + ETF seed list ({r.securities_seen} securities known)"))
-        except Exception as exc:  # noqa: BLE001
-            steps.append(("universe", f"FAILED: {exc}"))
-            logger.exception("run-daily: universe sync failed")
-
-        console.rule("2/6 Prices (tracked universe)")
-        try:
-            r = sync_recent_prices(settings, con, None, 10, dry_run)
-            if r.total_symbols == 0:
-                steps.append(("prices", "SKIPPED - tracked universe is empty (use 'stockdb universe add')"))
-            elif r.dry_run:
-                steps.append(("prices", f"would check/update {r.total_symbols} tracked securities"))
-            else:
-                steps.append(("prices", f"ok ({r.successful}/{r.total_symbols}, {r.rows_written} rows)"))
-        except Exception as exc:  # noqa: BLE001
-            steps.append(("prices", f"FAILED: {exc}"))
-            logger.exception("run-daily: price sync failed")
-
-        console.rule("3/6 VIX")
-        try:
-            r = sync_vix(settings, con, dry_run)
-            steps.append(("vix", "would fetch latest VIX" if r.dry_run else f"ok ({r.rows_written} rows)"))
-        except Exception as exc:  # noqa: BLE001
-            steps.append(("vix", f"FAILED: {exc}"))
-            logger.exception("run-daily: vix sync failed")
-
-        console.rule("4/6 Macro (FRED)")
-        try:
-            r = sync_macro(settings, con, None, None, dry_run)
-            if r.status == "skipped":
-                steps.append(("macro", f"SKIPPED - {r.skip_reason}"))
-            elif r.dry_run:
-                steps.append(("macro", f"would fetch {r.series_synced} FRED series"))
-            else:
-                steps.append(("macro", f"ok ({r.series_synced} series, {r.rows_written} rows)"))
-        except Exception as exc:  # noqa: BLE001
-            steps.append(("macro", f"FAILED: {exc}"))
-            logger.exception("run-daily: macro sync failed unexpectedly")
-
-        console.rule("5/6 SEC filings (tracked CIKs)")
-        try:
-            r = sync_filings(settings, con, None, dry_run)
-            if r.status == "skipped":
-                steps.append(("filings", f"SKIPPED - {r.skip_reason}"))
-            elif r.dry_run:
-                steps.append(("filings", f"would check {r.successful} tracked CIK(s)"))
-            else:
-                steps.append(("filings", f"ok ({r.successful} CIKs, {r.rows_written} rows)"))
-        except Exception as exc:  # noqa: BLE001
-            steps.append(("filings", f"FAILED: {exc}"))
-            logger.exception("run-daily: filings sync failed unexpectedly")
-
-        console.rule("6/6 Validation (tracked universe)")
-        try:
-            summary = validate_prices(settings, con, None, dry_run, all_universe=False)
-            if summary.scope_size == 0:
-                steps.append(("validation", "SKIPPED - tracked universe is empty"))
-            else:
-                steps.append(("validation", f"{summary.issues_found} issues ({summary.critical} critical) over {summary.scope_size} securities"))
-        except Exception as exc:  # noqa: BLE001
-            steps.append(("validation", f"FAILED: {exc}"))
-            logger.exception("run-daily: validation failed")
-
+        pipeline = run_daily_pipeline(settings, con, dry_run)
         report = gather_status(settings, con)
 
     table = Table(title=title + " summary")
     table.add_column("Step")
     table.add_column("Result")
-    for name, result in steps:
-        table.add_row(name, result)
+    for step in pipeline.steps:
+        table.add_row(step.name, step.result)
     console.print(table)
     console.print(
         f"[bold]Tracked price securities:[/bold] {report.universe.tracked_for_prices} | "
         f"[bold]Prices latest date:[/bold] {report.prices.latest_date} | "
         f"[bold]Open critical issues:[/bold] {report.data_quality.critical_open}"
     )
+    if pipeline.aborted:
+        raise typer.Exit(1)
 
 
 if __name__ == "__main__":

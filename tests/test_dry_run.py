@@ -184,3 +184,23 @@ def test_dry_run_leaves_lake_file_count_unchanged(con, settings, monkeypatch) ->
 
     files_after = len(ds.all_files())
     assert files_before == files_after == 0
+
+
+def test_dry_run_daily_pipeline_includes_feature_label_steps(con, settings, monkeypatch) -> None:
+    from app.ingestion.daily_pipeline import run_daily_pipeline
+    from app.ingestion.universe_sync import sync_universe
+    from app.providers.security_master.sec_provider import SecUniverseProvider
+    from app.providers.volatility.cboe_vix_provider import CboeVixProvider
+    from app.providers.price.yfinance_provider import YFinancePriceProvider
+
+    monkeypatch.setattr(SecUniverseProvider, "fetch_universe", _fail_if_called)
+    monkeypatch.setattr(CboeVixProvider, "fetch_history", _fail_if_called)
+    monkeypatch.setattr(YFinancePriceProvider, "fetch_daily_bars", _fail_if_called)
+
+    result = run_daily_pipeline(settings, con, dry_run=True)
+    names = [s.name for s in result.steps]
+    assert "features" in names
+    assert "labels" in names
+    assert "feature_label_validation" in names
+    _assert_no_mutations(con, settings)
+    assert not any(settings.lake_dir.rglob("*.parquet"))

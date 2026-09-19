@@ -88,6 +88,29 @@ class ResearchIntegrityStatus:
 
 
 @dataclass
+class FeaturesStatus:
+    rows: int = 0
+    latest_date: str | None = None
+    tracked_current: int = 0
+    tracked_stale: int = 0
+
+
+@dataclass
+class LabelsStatus:
+    rows: int = 0
+    latest_date: str | None = None
+    latest_mature_horizon: str | None = None
+    recent_null_expected: bool = True
+
+
+@dataclass
+class DailyStatus:
+    last_success: str | None = None
+    last_failure: str | None = None
+    failed_symbols: list[str] = field(default_factory=list)
+
+
+@dataclass
 class StatusReport:
     universe: UniverseStatus
     prices: PricesStatus
@@ -98,6 +121,9 @@ class StatusReport:
     jobs: JobsStatus
     data_quality: DataQualityStatus
     research_integrity: ResearchIntegrityStatus
+    features: FeaturesStatus = field(default_factory=FeaturesStatus)
+    labels: LabelsStatus = field(default_factory=LabelsStatus)
+    daily: DailyStatus = field(default_factory=DailyStatus)
 
 
 def _dir_size(path: Path) -> int:
@@ -266,4 +292,67 @@ def gather_status(settings: Settings, con: duckdb.DuckDBPyConnection) -> StatusR
         commercial_use_safe=meta.get("research_only_price_provider") == "false",
     )
 
-    return StatusReport(universe, prices, macro, vix, sec, storage, jobs, dq, research_integrity)
+    from app.services.tracked_universe_service import get_tracked_feature_security_ids
+
+    feature_ids = get_tracked_feature_security_ids(con)
+    features_ds = get_lake_dataset(settings.lake_dir, "features_daily")
+    if features_ds.has_any_files():
+        f_rows, f_max = con.execute("SELECT count(*), max(date) FROM features_daily").fetchone()
+        if feature_ids:
+            latest_expected = calendar.latest_expected_session()
+            cutoff = calendar.sessions_ago(latest_expected, 5)
+            placeholders = ", ".join("?" for _ in feature_ids)
+            last_rows = con.execute(
+                f"SELECT security_id, max(date) FROM features_daily WHERE security_id IN ({placeholders}) GROUP BY security_id",
+                feature_ids,
+            ).fetchall()
+            last_map = {r[0]: r[1] for r in last_rows}
+            f_current = sum(1 for sid in feature_ids if last_map.get(sid) and last_map[sid] >= cutoff)
+            f_stale = len(feature_ids) - f_current
+        else:
+            f_current = f_stale = 0
+        features = FeaturesStatus(rows=f_rows or 0, latest_date=str(f_max) if f_max else None, tracked_current=f_current, tracked_stale=f_stale)
+    else:
+        features = FeaturesStatus()
+
+    labels_ds = get_lake_dataset(settings.lake_dir, "labels_forward_returns")
+    if labels_ds.has_any_files():
+        l_rows, l_max = con.execute("SELECT count(*), max(date) FROM labels_forward_returns").fetchone()
+        mature = None
+        try:
+            mature_row = con.execute(
+                "SELECT max(date) FROM labels_forward_returns WHERE forward_return_20d IS NOT NULL"
+            ).fetchone()
+            mature = str(mature_row[0]) if mature_row and mature_row[0] else None
+        except Exception:  # noqa: BLE001
+            mature = None
+        labels = LabelsStatus(
+            rows=l_rows or 0,
+            latest_date=str(l_max) if l_max else None,
+            latest_mature_horizon=mature,
+            recent_null_expected=True,
+        )
+    else:
+        labels = LabelsStatus()
+
+    last_daily_ok = con.execute(
+        "SELECT started_at FROM ingest_runs WHERE dataset IN ('features_daily','labels_forward_returns','prices_daily') "
+        "AND status = 'success' ORDER BY started_at DESC LIMIT 1"
+    ).fetchone()
+    last_daily_fail = con.execute(
+        "SELECT started_at, error_message FROM ingest_runs WHERE status = 'failed' ORDER BY started_at DESC LIMIT 1"
+    ).fetchone()
+    failed_symbols: list[str] = []
+    for _key, state in checkpoint_store.list_all():
+        for item in state.get("failed", []):
+            if isinstance(item, dict) and item.get("symbol"):
+                failed_symbols.append(str(item["symbol"]))
+    daily = DailyStatus(
+        last_success=str(last_daily_ok[0]) if last_daily_ok else None,
+        last_failure=str(last_daily_fail[0]) if last_daily_fail else None,
+        failed_symbols=sorted(set(failed_symbols))[:20],
+    )
+
+    return StatusReport(
+        universe, prices, macro, vix, sec, storage, jobs, dq, research_integrity, features, labels, daily
+    )

@@ -5,6 +5,8 @@ import pytest
 
 from app.db.schema import apply_schema
 from app.services.dataset_metadata_service import (
+    FEATURES_DAILY_DATASET,
+    LABELS_FORWARD_RETURNS_DATASET,
     PRICES_DAILY_DATASET,
     get_metadata,
     seed_research_integrity_metadata,
@@ -38,7 +40,7 @@ def test_seed_is_idempotent_and_reflects_current_settings(con, settings) -> None
     rows = con.execute(
         "SELECT count(*) FROM dataset_metadata WHERE dataset_name = ?", [PRICES_DAILY_DATASET]
     ).fetchone()[0]
-    assert rows == 5  # no duplicate rows from re-seeding
+    assert rows == 7  # no duplicate rows from re-seeding
 
 
 def test_set_metadata_upserts(con) -> None:
@@ -48,6 +50,20 @@ def test_set_metadata_upserts(con) -> None:
     assert meta["k"] == "v2"
     count = con.execute("SELECT count(*) FROM dataset_metadata WHERE metadata_key = 'k'").fetchone()[0]
     assert count == 1
+
+
+def test_seed_feature_and_label_integrity_flags(con, settings) -> None:
+    seed_research_integrity_metadata(con, settings)
+    feat = get_metadata(con, FEATURES_DAILY_DATASET)
+    lab = get_metadata(con, LABELS_FORWARD_RETURNS_DATASET)
+    assert feat["signal_timing"] == "market_close"
+    assert feat["price_adjustment_point_in_time"] == "false"
+    assert feat["macro_point_in_time"] == "false"
+    assert feat["survivorship_safe"] == "false"
+    assert feat["point_in_time_security_master"] == "false"
+    assert lab["return_basis"] == "adjusted_close"
+    assert lab["benchmark"] == "SPY"
+    assert lab["historical_universe_complete"] == "false"
 
 
 def test_status_report_exposes_research_integrity(con, settings) -> None:

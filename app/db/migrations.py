@@ -12,7 +12,10 @@ import duckdb
 
 from app.config.settings import Settings
 from app.services.dataset_metadata_service import seed_research_integrity_metadata
-from app.services.tracked_universe_service import auto_register_from_existing_price_data
+from app.services.tracked_universe_service import (
+    auto_register_from_existing_price_data,
+    enable_feature_tracking_for_price_tracked,
+)
 from app.utils.logging import get_logger
 
 logger = get_logger("migrations")
@@ -24,5 +27,11 @@ def run_migrations(con: duckdb.DuckDBPyConnection, settings: Settings) -> None:
         logger.info(
             "Migration: auto-registered %d security(ies) with existing price data into tracked_securities",
             newly_tracked,
+        )
+    newly_featured = enable_feature_tracking_for_price_tracked(con)
+    if newly_featured:
+        logger.info(
+            "Migration: enabled feature_tracking on %d price-tracked security(ies)",
+            newly_featured,
         )
     seed_research_integrity_metadata(con, settings)

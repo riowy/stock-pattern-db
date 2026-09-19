@@ -84,6 +84,13 @@ class MarketCalendarService:
             cursor = self.previous_trading_day(cursor)
         return cursor
 
+    def sessions_ahead(self, d: date, n: int) -> date:
+        """``d`` shifted forward by ``n`` trading sessions (n >= 0)."""
+        cursor = d
+        for _ in range(n):
+            cursor = self.next_trading_day(cursor)
+        return cursor
+
     # ------------------------------------------------------------------ "now"
     def latest_expected_session(self, now: datetime | None = None) -> date:
         """The most recent trading session whose end-of-day data should

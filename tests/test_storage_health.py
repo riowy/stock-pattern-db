@@ -142,9 +142,11 @@ def test_dataset_policy_flags_migration_pending_for_old_monthly_layout(settings)
     assert policies["volatility"].migration_pending is True
 
 
-def test_dataset_policy_future_datasets_marked_not_implemented(settings) -> None:
+def test_dataset_policy_features_and_labels_are_implemented(settings) -> None:
     from app.services.storage_health_service import get_dataset_policies
 
     policies = {p.dataset: p for p in get_dataset_policies(settings)}
-    assert policies["features_daily"].implemented is False
-    assert policies["labels_forward_returns"].implemented is False
+    assert policies["features_daily"].implemented is True
+    assert policies["labels_forward_returns"].implemented is True
+    assert policies["features_daily"].granularity == "month"
+    assert policies["labels_forward_returns"].granularity == "month"

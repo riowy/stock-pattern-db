@@ -156,29 +156,64 @@ def apply_schema(con: duckdb.DuckDBPyConnection) -> None:
 def create_lake_views(con: duckdb.DuckDBPyConnection, settings) -> None:  # noqa: ANN001
     """Create/refresh DuckDB views over the Parquet lake for convenient SQL.
 
-    Each view applies a "last write wins" dedup (by ``retrieved_at``) over
-    ``dedup_keys`` so callers never have to think about overlapping
-    re-ingestion runs. Views are skipped (not created) for datasets that have
-    no Parquet files yet.
-    """
-    from app.config.lake_datasets import get_lake_dataset, implemented_dataset_keys
+    Each view applies a "last write wins" dedup (by the dataset's
+    ``tie_break_column``) over ``dedup_keys`` so callers never have to think
+    about overlapping re-ingestion / re-compute runs. Views are skipped
+    (not created) for datasets that have no Parquet files yet.
 
+    ``research_daily`` is a convenience join of features + labels. Feature
+    calculation code must not read it.
+    """
+    from app.config.lake_datasets import get_lake_dataset, get_spec, implemented_dataset_keys
+
+    created: set[str] = set()
     for name in implemented_dataset_keys():
+        spec = get_spec(name)
         ds = get_lake_dataset(settings.lake_dir, name)
         if not ds.has_any_files():
             continue
         glob_path = ds.glob_pattern().replace("'", "''")
         key_cols = ", ".join(ds.dedup_keys)
+        tie = spec.tie_break_column
         sql = f"""
             CREATE OR REPLACE VIEW {name} AS
             SELECT * EXCLUDE (__rn)
             FROM (
                 SELECT *, row_number() OVER (
                     PARTITION BY {key_cols}
-                    ORDER BY retrieved_at DESC
+                    ORDER BY {tie} DESC
                 ) AS __rn
                 FROM read_parquet('{glob_path}', hive_partitioning = true)
             )
             WHERE __rn = 1
         """
         con.execute(sql)
+        created.add(name)
+
+    _create_research_daily_view(con, created)
+
+
+def _create_research_daily_view(con: duckdb.DuckDBPyConnection, created: set[str]) -> None:
+    if "features_daily" not in created or "labels_forward_returns" not in created:
+        return
+    from app.features.schema import FEATURE_VALUE_COLUMNS
+    from app.labels.schema import LABEL_VALUE_COLUMNS
+
+    feature_cols = ", ".join(f"f.{c}" for c in FEATURE_VALUE_COLUMNS)
+    label_cols = ", ".join(f"l.{c}" for c in LABEL_VALUE_COLUMNS)
+    sql = f"""
+        CREATE OR REPLACE VIEW research_daily AS
+        SELECT
+            f.security_id,
+            f.ticker_at_time AS ticker,
+            f.date,
+            f.feature_version,
+            l.label_version,
+            {feature_cols},
+            {label_cols}
+        FROM features_daily f
+        LEFT JOIN labels_forward_returns l
+          ON f.security_id = l.security_id
+         AND f.date = l.date
+    """
+    con.execute(sql)

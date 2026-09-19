@@ -16,6 +16,8 @@ from app.config.settings import Settings
 from app.providers.registry import get_price_provider_class
 
 PRICES_DAILY_DATASET = "prices_daily"
+FEATURES_DAILY_DATASET = "features_daily"
+LABELS_FORWARD_RETURNS_DATASET = "labels_forward_returns"
 
 
 def set_metadata(con: duckdb.DuckDBPyConnection, dataset_name: str, key: str, value: str) -> None:
@@ -53,3 +55,37 @@ def seed_research_integrity_metadata(con: duckdb.DuckDBPyConnection, settings: S
     set_metadata(con, PRICES_DAILY_DATASET, "point_in_time_security_master", "false")
     set_metadata(con, PRICES_DAILY_DATASET, "research_only_price_provider", str(research_only).lower())
     set_metadata(con, PRICES_DAILY_DATASET, "price_provider", settings.price_provider)
+    set_metadata(con, PRICES_DAILY_DATASET, "commercial_use_safe", "false")
+    set_metadata(con, PRICES_DAILY_DATASET, "usage", "research/prototype only")
+
+    set_metadata(con, FEATURES_DAILY_DATASET, "feature_version", "v1")
+    set_metadata(con, FEATURES_DAILY_DATASET, "signal_timing", "market_close")
+    set_metadata(con, FEATURES_DAILY_DATASET, "historical_universe_complete", "false")
+    set_metadata(con, FEATURES_DAILY_DATASET, "survivorship_safe", "false")
+    set_metadata(con, FEATURES_DAILY_DATASET, "point_in_time_security_master", "false")
+    set_metadata(con, FEATURES_DAILY_DATASET, "price_adjustment_point_in_time", "false")
+    set_metadata(con, FEATURES_DAILY_DATASET, "macro_point_in_time", "false")
+    set_metadata(
+        con,
+        FEATURES_DAILY_DATASET,
+        "macro_excluded_reason",
+        "FRED observation_date is not a verified publication/revision timestamp; v1 does not join macro.",
+    )
+    set_metadata(con, FEATURES_DAILY_DATASET, "sector_relative_strength", "null_until_trusted_mapping")
+    set_metadata(con, FEATURES_DAILY_DATASET, "usage", "research/prototype only")
+    set_metadata(con, FEATURES_DAILY_DATASET, "commercial_use_safe", "false")
+
+    set_metadata(con, LABELS_FORWARD_RETURNS_DATASET, "label_version", "v1")
+    set_metadata(con, LABELS_FORWARD_RETURNS_DATASET, "return_basis", "adjusted_close")
+    set_metadata(con, LABELS_FORWARD_RETURNS_DATASET, "benchmark", "SPY")
+    set_metadata(con, LABELS_FORWARD_RETURNS_DATASET, "historical_universe_complete", "false")
+    set_metadata(con, LABELS_FORWARD_RETURNS_DATASET, "survivorship_safe", "false")
+    set_metadata(
+        con,
+        LABELS_FORWARD_RETURNS_DATASET,
+        "max_drawdown_definition",
+        "min(adj_close(t+1..t+h)/adj_close(t)-1); close-to-close vs entry close, not path-dependent peak-to-trough",
+    )
+    set_metadata(con, LABELS_FORWARD_RETURNS_DATASET, "horizon_unit", "trading_sessions")
+    set_metadata(con, LABELS_FORWARD_RETURNS_DATASET, "usage", "research/prototype only")
+    set_metadata(con, LABELS_FORWARD_RETURNS_DATASET, "commercial_use_safe", "false")

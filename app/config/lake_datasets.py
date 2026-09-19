@@ -36,6 +36,7 @@ class LakeDatasetSpec:
     sort_keys: list[str]
     granularity: Granularity
     implemented: bool = True  # False = documented policy only, no data yet
+    tie_break_column: str = "retrieved_at"
 
 
 LAKE_DATASET_SPECS: dict[str, LakeDatasetSpec] = {
@@ -60,22 +61,33 @@ LAKE_DATASET_SPECS: dict[str, LakeDatasetSpec] = {
     "short_volume": LakeDatasetSpec(
         "short_volume", "short_volume", "date", ["security_id", "date"], ["security_id", "date"], "month"
     ),
-    # Not implemented yet (see spec section 15 "향후 확장을 위한 schema") --
-    # documented here purely so 'stockdb storage-health' can show the
-    # intended policy ahead of time.
     "features_daily": LakeDatasetSpec(
-        "features_daily", "features_daily", "date", ["security_id", "date"], ["security_id", "date"], "month",
-        implemented=False,
+        "features_daily",
+        "features_daily",
+        "date",
+        ["security_id", "date", "feature_version"],
+        ["security_id", "date"],
+        "month",
+        implemented=True,
+        tie_break_column="calculated_at",
     ),
     "labels_forward_returns": LakeDatasetSpec(
-        "labels_forward_returns", "labels_forward_returns", "date", ["security_id", "date"], ["security_id", "date"],
-        "month", implemented=False,
+        "labels_forward_returns",
+        "labels_forward_returns",
+        "date",
+        ["security_id", "date", "label_version"],
+        ["security_id", "date"],
+        "month",
+        implemented=True,
+        tie_break_column="calculated_at",
     ),
 }
 
 # Short, CLI-facing aliases for backwards compatibility (e.g. `stockdb compact prices`).
 DATASET_ALIASES: dict[str, str] = {
     "prices": "prices_daily",
+    "features": "features_daily",
+    "labels": "labels_forward_returns",
 }
 
 
@@ -98,6 +110,7 @@ def get_lake_dataset(lake_dir: Path, name: str) -> LakeDataset:
         spec.date_column,
         spec.dedup_keys,
         spec.sort_keys,
+        tie_break_column=spec.tie_break_column,
         granularity=spec.granularity,
     )
 

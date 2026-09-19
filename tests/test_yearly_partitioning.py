@@ -34,13 +34,15 @@ def test_yearly_dataset_writes_one_partition_per_year(tmp_path: Path) -> None:
 
 
 def test_yearly_dataset_glob_pattern_is_flat() -> None:
-    ds = LakeDataset(Path("/tmp/x"), "date", ["date"], ["date"], granularity="year")
-    assert ds.glob_pattern() == "/tmp/x/year=*/*.parquet"
+    base = Path("/tmp/x")
+    ds = LakeDataset(base, "date", ["date"], ["date"], granularity="year")
+    assert ds.glob_pattern() == str(base / "year=*" / "*.parquet")
 
 
 def test_monthly_dataset_glob_pattern_unchanged() -> None:
-    ds = LakeDataset(Path("/tmp/x"), "date", ["date"], ["date"], granularity="month")
-    assert ds.glob_pattern() == "/tmp/x/year=*/month=*/*.parquet"
+    base = Path("/tmp/x")
+    ds = LakeDataset(base, "date", ["date"], ["date"], granularity="month")
+    assert ds.glob_pattern() == str(base / "year=*" / "month=*" / "*.parquet")
 
 
 def test_yearly_partition_dir_rejects_month() -> None:

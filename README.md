@@ -19,7 +19,8 @@ external data sources
     -> normalization (app/normalization)  <- provider-specific -> internal schema
     -> Parquet data lake (data/lake)      <- bulk time series, hive-partitioned, ZSTD
     -> DuckDB catalog (data/state)        <- security master, job provenance, DQ issues
-    -> (future) features / pattern analysis
+    -> features_daily / labels_forward_returns
+    -> research_daily convenience view
 ```
 
 * **Large time series live in Parquet, not in DuckDB tables.** DuckDB is used as
@@ -339,8 +340,88 @@ crontab -e
 `scripts/run_daily.sh`, and a `run-daily.timer` with `OnCalendar=*-*-* 09:00:00`,
 then `systemctl enable --now run-daily.timer`.
 
-**Windows (Task Scheduler):** create a daily task that runs
-`powershell.exe -ExecutionPolicy Bypass -File C:\path\to\stock-pattern-db\scripts\run_daily.ps1`.
+**Windows (Task Scheduler):** do **not** auto-register. From an elevated
+PowerShell session, after reviewing `STOCKDB_DAILY_TIME` (default `09:00`,
+machine local time -- on a Seoul box that is well after the US cash close):
+
+```powershell
+.\scripts\register_daily_task.ps1
+.\scripts\unregister_daily_task.ps1
+```
+
+Administrator rights are typically required. Timezone is never hardcoded in
+Python; the Task Scheduler uses the machine's local clock.
+
+---
+
+## 8.3 Features and labels (v1)
+
+Signal timing is **US regular-session close on trading day t**. `date=t`
+features may use information observable at that close (OHLCV of t, VIX of t,
+past prices). They must not use t+1 prices, future volume, future news, or
+FRED values whose publication time is unverified.
+
+```bash
+uv run stockdb compute-features --start 2024-01-01 --dry-run
+uv run stockdb compute-labels --start 2024-01-01 --dry-run
+uv run stockdb compute-features --start 2024-01-01
+uv run stockdb compute-labels --start 2024-01-01
+```
+
+Omitting `--symbols` uses `tracked_securities` with `feature_tracking=true`
+-- never the full ~10k security master.
+
+**Price adjustment (derived, never written back to `prices_daily`):**
+
+`adjustment_factor = adj_close / close`
+
+`adjusted_open/high/low = raw * factor`, `adjusted_close = adj_close`.
+
+If `close` or `adj_close` is null/0, adjusted series are null. There is **no**
+silent fallback to raw close. Absolute adjusted prices are never features --
+only ratios / returns / distances. `price_adjustment_point_in_time=false`
+(Yahoo back-adjusts history).
+
+**Labels** use trading-session horizons 1/3/5/10/20, not calendar days.
+`forward_return_h = adj_close(t+h)/adj_close(t)-1`. Missing future sessions
+are null, never 0. `max_drawdown_next_h` is the minimum close-to-close return
+versus date-t close over the next h sessions -- not a path-dependent
+peak-to-trough drawdown.
+
+**Incremental:** features read ~300 lookback sessions but write only the
+requested range. Daily label updates recompute the last ~30 sessions so
+newly mature `forward_return_20d` values get filled.
+
+**FRED is not joined into v1 features** (`macro_point_in_time=false`).
+Sector relative strength columns exist but stay null until a trusted mapping
+exists.
+
+Query convenience view (do not use it inside the feature engine):
+
+```sql
+SELECT ticker, date, ret_20d, rsi_14, volume_ratio_20d, rel_spy_20d,
+       forward_return_10d, forward_excess_spy_10d
+FROM research_daily
+WHERE ticker = 'AAPL'
+ORDER BY date DESC
+LIMIT 30;
+```
+
+### Research-scale expansion (not an investment universe)
+
+```bash
+uv run stockdb expand-universe --research-scale 100
+uv run stockdb backfill-prices --tracked --start 2018-01-01 --resume
+uv run stockdb compute-features --start 2018-01-01 --resume
+uv run stockdb compute-labels --start 2018-01-01 --resume
+```
+
+Full active-universe long-term backfill is **never** started automatically:
+
+```bash
+uv run stockdb expand-universe --all-active --dry-run
+uv run stockdb backfill-prices --all-active --start 2000-01-01 --dry-run
+```
 
 ---
 
@@ -384,19 +465,25 @@ directory skeleton at the new location. Nothing else needs to change.
 |---|---|
 | `stockdb init` | Create directories + DuckDB schema + seed config data. |
 | `stockdb sync-universe [--dry-run]` | Sync security master from SEC + ETF seed list. |
-| `stockdb backfill-prices --start DATE [--symbols A,B,C] [--end DATE] [--batch-size N] [--resume] [--dry-run]` | Backfill daily price history. |
+| `stockdb backfill-prices --start DATE [--symbols A,B,C] [--tracked] [--all-active] [--end DATE] [--batch-size N] [--resume] [--dry-run]` | Backfill daily price history. |
 | `stockdb sync-prices [--symbols ...] [--lookback-days N] [--dry-run]` | Incremental daily price refresh for the tracked universe. |
 | `stockdb sync-macro [--series ...] [--start DATE] [--dry-run]` | Sync FRED macro series. |
 | `stockdb sync-vix [--dry-run]` | Sync official Cboe VIX history. |
 | `stockdb sync-sec-filings [--ciks ...] [--dry-run]` | Sync SEC filing metadata (10-K/10-Q/8-K/20-F/6-K) for the tracked (filings-enabled) CIKs. |
+| `stockdb compute-features --start DATE [--symbols ...] [--end DATE] [--version v1] [--resume] [--dry-run]` | Compute `features_daily` for the feature-tracking universe. |
+| `stockdb compute-labels --start DATE [--symbols ...] [--end DATE] [--version v1] [--resume] [--dry-run]` | Compute `labels_forward_returns` (session horizons; immature = null). |
+| `stockdb expand-universe --research-scale 100\|500 [--dry-run]` | Deterministic scale-test universe (not an investment universe). |
+| `stockdb expand-universe --all-active [--dry-run]` | Register every active security as tracked. Does **not** start a backfill. |
 | `stockdb validate prices [--symbols ...] [--all-universe] [--dry-run]` | Run data-quality checks (tracked universe by default). |
-| `stockdb compact prices [--year Y --month M] [--dry-run]` | Merge small Parquet files into one per partition (also: `macro`, `volatility`, `filings`). |
+| `stockdb validate features [--symbols ...] [--dry-run]` | Feature validation (RSI bounds, negative ATR/vol, inf). |
+| `stockdb validate labels [--symbols ...] [--dry-run]` | Label validation (return < -1, extremes). Never winsorizes. |
+| `stockdb compact prices [--year Y --month M] [--dry-run]` | Merge small Parquet files into one per partition (also: `macro`, `volatility`, `filings`, `features`, `labels`). |
 | `stockdb storage-health [--dataset NAME]` | Show per-partition file/size stats and flag compaction candidates. |
 | `stockdb universe tracked [--include-disabled]` | List the tracked (operational) universe. |
 | `stockdb universe add TICKER... [--reason TEXT] [--no-filings]` | Add tickers to the tracked universe. |
 | `stockdb universe remove TICKER...` | Soft-remove tickers from the tracked universe (history kept). |
 | `stockdb status` | Show DB/lake/job status as Rich tables. |
-| `stockdb run-daily [--dry-run]` | Run the full daily pipeline end to end (tracked universe only). |
+| `stockdb run-daily [--dry-run]` | Daily pipeline: universe → prices → VIX → FRED → filings → validate → incremental features → recent labels → validate. |
 
 ---
 
@@ -427,10 +514,12 @@ stock-pattern-db/
       volatility/
       filings/
       short_volume/
+      features_daily/
+      labels_forward_returns/
     state/           # DuckDB catalog + checkpoints
     logs/            # rotating log files
 
-  scripts/          # run_daily.sh/.ps1, backup.sh/.ps1
+  scripts/          # run_daily.sh/.ps1, register/unregister_daily_task.ps1, backup.sh/.ps1
   tests/            # pytest suite (no live network calls)
 ```
 
@@ -520,6 +609,13 @@ for exactly this reason.
   `stockdb validate prices` and review `data_quality_issues` before drawing
   conclusions from the data; validation records findings, it never silently
   deletes or "fixes" data.
+* **`survivorship_safe=false`.** The current universe is today's listed names
+  plus a small ETF seed. Delisted history is incomplete.
+* **`point_in_time_security_master=false`.** Ticker/exchange as-of-date is
+  not reconstructed for dates before this pipeline started.
+* **`price_adjustment_point_in_time=false`.** Adjustment uses the provider's
+  current `adj_close/close` factor, which is back-filled after later splits
+  and dividends. A stricter PIT adjustment vendor can replace this later.
 
 These same limitations are also written as **machine-readable metadata**
 (`dataset_metadata` table / `stockdb status`'s "Research integrity" panel) --
@@ -554,9 +650,9 @@ security").
 
 ## 15. Resource usage principles
 
-* Defaults (`MAX_WORKERS=4`, `PRICE_BATCH_SIZE=50`, `DUCKDB_THREADS=6`,
-  `DUCKDB_MEMORY_LIMIT=24GB`) are tuned for a shared, single-CPU 64GB server
-  that may also be used for other things.
+* Defaults (`MAX_WORKERS=2`, `PRICE_BATCH_SIZE=25`, `FEATURE_BATCH_SIZE=50`,
+  `DUCKDB_THREADS=6`, `DUCKDB_MEMORY_LIMIT=24GB`) are tuned for a shared,
+  single-CPU 64GB server that may also be used for other things.
 * Backfills process fixed-size batches with a checkpoint after every batch,
   so a long-running job never needs to hold the whole universe in memory,
   and never needs to restart from scratch after an interruption.
