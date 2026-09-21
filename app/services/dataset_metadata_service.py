@@ -74,6 +74,10 @@ def seed_research_integrity_metadata(con: duckdb.DuckDBPyConnection, settings: S
     set_metadata(con, FEATURES_DAILY_DATASET, "sector_relative_strength", "null_until_trusted_mapping")
     set_metadata(con, FEATURES_DAILY_DATASET, "usage", "research/prototype only")
     set_metadata(con, FEATURES_DAILY_DATASET, "commercial_use_safe", "false")
+    set_metadata(con, FEATURES_DAILY_DATASET, "instrument_class_complete", "false")
+
+    set_metadata(con, PRICES_DAILY_DATASET, "price_adjustment_point_in_time", "false")
+    set_metadata(con, PRICES_DAILY_DATASET, "instrument_class_complete", "false")
 
     set_metadata(con, LABELS_FORWARD_RETURNS_DATASET, "label_version", "v1")
     set_metadata(con, LABELS_FORWARD_RETURNS_DATASET, "return_basis", "adjusted_close")
@@ -89,3 +93,5 @@ def seed_research_integrity_metadata(con: duckdb.DuckDBPyConnection, settings: S
     set_metadata(con, LABELS_FORWARD_RETURNS_DATASET, "horizon_unit", "trading_sessions")
     set_metadata(con, LABELS_FORWARD_RETURNS_DATASET, "usage", "research/prototype only")
     set_metadata(con, LABELS_FORWARD_RETURNS_DATASET, "commercial_use_safe", "false")
+    set_metadata(con, LABELS_FORWARD_RETURNS_DATASET, "instrument_class_complete", "false")
+    set_metadata(con, LABELS_FORWARD_RETURNS_DATASET, "price_adjustment_point_in_time", "false")

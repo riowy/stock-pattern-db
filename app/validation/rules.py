@@ -16,6 +16,7 @@ from datetime import date, datetime
 import polars as pl
 
 from app.services.market_calendar import MarketCalendarService
+from app.validation.numeric_tolerance import approximately_ge_expr
 
 Issue = dict
 
@@ -44,7 +45,13 @@ def check_negative_values(df: pl.DataFrame) -> list[Issue]:
 
 
 def check_ohlc_consistency(df: pl.DataFrame) -> list[Issue]:
-    """high must be >= low/open/close; low must be <= open/close."""
+    """high >= low/open/close and low <= open/close, with numeric tolerance.
+
+    Strict floating-point inequality can flag 0.0001 rounding on a $24 bar
+    as critical. Those become ``OHLC_ROUNDING_TOLERANCE`` (info). Gaps that
+    remain after ``max(0.001, 1e-5 * scale)`` stay ``OHLC_INCONSISTENT``
+    (critical). Raw prices are never auto-corrected.
+    """
     complete = df.filter(
         pl.col("open").is_not_null()
         & pl.col("high").is_not_null()
@@ -54,15 +61,19 @@ def check_ohlc_consistency(df: pl.DataFrame) -> list[Issue]:
     issues: list[Issue] = []
 
     checks = [
-        (pl.col("high") < pl.col("low"), "high < low"),
-        (pl.col("high") < pl.col("open"), "high < open"),
-        (pl.col("high") < pl.col("close"), "high < close"),
-        (pl.col("low") > pl.col("open"), "low > open"),
-        (pl.col("low") > pl.col("close"), "low > close"),
+        (pl.col("high") < pl.col("low"), approximately_ge_expr("high", "low"), "high < low"),
+        (pl.col("high") < pl.col("open"), approximately_ge_expr("high", "open"), "high < open"),
+        (pl.col("high") < pl.col("close"), approximately_ge_expr("high", "close"), "high < close"),
+        (pl.col("low") > pl.col("open"), approximately_ge_expr("open", "low"), "low > open"),
+        (pl.col("low") > pl.col("close"), approximately_ge_expr("close", "low"), "low > close"),
     ]
-    for cond, label in checks:
-        bad = complete.filter(cond)
-        for row in bad.iter_rows(named=True):
+    for strict_cond, tol_ok, label in checks:
+        strict_bad = complete.filter(strict_cond)
+        if strict_bad.height == 0:
+            continue
+        true_violations = strict_bad.filter(~tol_ok)
+        rounding_only = strict_bad.filter(tol_ok)
+        for row in true_violations.iter_rows(named=True):
             issues.append(
                 _issue(
                     row["security_id"],
@@ -70,6 +81,16 @@ def check_ohlc_consistency(df: pl.DataFrame) -> list[Issue]:
                     "OHLC_INCONSISTENT",
                     "critical",
                     f"{label} (O={row['open']} H={row['high']} L={row['low']} C={row['close']})",
+                )
+            )
+        for row in rounding_only.iter_rows(named=True):
+            issues.append(
+                _issue(
+                    row["security_id"],
+                    row["date"],
+                    "OHLC_ROUNDING_TOLERANCE",
+                    "info",
+                    f"{label} within abs/rel tolerance (O={row['open']} H={row['high']} L={row['low']} C={row['close']})",
                 )
             )
     return issues

@@ -37,3 +37,11 @@ data/logs/*.log*
 # Local repartition/migration backups
 data/lake/*_backup_*/
 data/lake/*_backup_*
+
+# Local scratch / ephemeral research outputs
+_tmp_*
+data/research/
+
+# Local scratch / ephemeral research outputs
+_tmp_*
+data/research/

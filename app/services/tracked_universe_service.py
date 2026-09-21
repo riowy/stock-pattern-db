@@ -33,6 +33,59 @@ class TrackedRow:
     notes: str | None
 
 
+def ensure_tracked(
+    con: duckdb.DuckDBPyConnection,
+    security_ids: list[str],
+    reason: str,
+    price_tracking: bool = True,
+    filings_tracking: bool = False,
+    feature_tracking: bool = True,
+    notes: str | None = None,
+) -> int:
+    """Insert missing tracked rows; enable/OR flags on existing ones.
+
+    Existing ``tracking_reason`` is preserved so a later named universe
+    (e.g. research-common-equity-500) cannot overwrite research-scale-100.
+    """
+    if not security_ids:
+        return 0
+    now = datetime.now(UTC)
+    df = pl.DataFrame(
+        {
+            "security_id": security_ids,
+            "enabled": [True] * len(security_ids),
+            "tracking_reason": [reason] * len(security_ids),
+            "added_at": [now] * len(security_ids),
+            "price_tracking": [price_tracking] * len(security_ids),
+            "filings_tracking": [filings_tracking] * len(security_ids),
+            "feature_tracking": [feature_tracking] * len(security_ids),
+            "notes": [notes] * len(security_ids),
+        }
+    )
+    con.register("_tmp_tracked_ensure", df)
+    try:
+        con.execute(
+            """
+            INSERT INTO tracked_securities
+                (security_id, enabled, tracking_reason, added_at, removed_at,
+                 price_tracking, filings_tracking, feature_tracking, notes)
+            SELECT security_id, enabled, tracking_reason, added_at, NULL,
+                   price_tracking, filings_tracking, feature_tracking, notes
+            FROM _tmp_tracked_ensure
+            ON CONFLICT (security_id) DO UPDATE SET
+                enabled = TRUE,
+                removed_at = NULL,
+                price_tracking = excluded.price_tracking OR tracked_securities.price_tracking,
+                filings_tracking = excluded.filings_tracking OR tracked_securities.filings_tracking,
+                feature_tracking = excluded.feature_tracking OR tracked_securities.feature_tracking,
+                notes = COALESCE(tracked_securities.notes, excluded.notes)
+            """
+        )
+    finally:
+        con.unregister("_tmp_tracked_ensure")
+    return len(security_ids)
+
+
 def add_tracked(
     con: duckdb.DuckDBPyConnection,
     security_ids: list[str],

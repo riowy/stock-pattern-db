@@ -14,7 +14,7 @@ from app.ingestion.feature_compute import compute_features
 from app.ingestion.filings_sync import sync_filings
 from app.ingestion.label_compute import compute_labels
 from app.ingestion.macro_sync import sync_macro
-from app.ingestion.price_sync import sync_recent_prices
+from app.ingestion.price_sync import PriceSyncResult, format_price_fast_path, sync_recent_prices
 from app.ingestion.universe_sync import sync_universe
 from app.ingestion.vix_sync import sync_vix
 from app.services.market_calendar import MarketCalendarService
@@ -24,6 +24,10 @@ from app.validation.runner import validate_features, validate_labels, validate_p
 logger = get_logger("daily_pipeline")
 
 FEATURE_DAILY_OVERLAP_SESSIONS = 5
+# Daily prices re-fetch ~10 calendar days. New tracked names can have price
+# rows in that window without feature identity rows. Fill missing identity
+# rows up to this many sessions; do not recompute the full history.
+FEATURE_MISSING_ROW_BACKFILL_SESSIONS = 10
 
 
 @dataclass
@@ -39,6 +43,11 @@ class DailyPipelineResult:
     steps: list[StepResult] = field(default_factory=list)
     aborted: bool = False
     dry_run: bool = False
+    price_symbols_requested: int = 0
+    price_symbols_skipped_current: int = 0
+    price_batches_requested: int = 0
+    price_rows_received: int = 0
+    price_provider_fetch_count: int = 0
 
 
 def _latest_price_date(con: duckdb.DuckDBPyConnection, settings: Settings) -> date | None:
@@ -68,7 +77,28 @@ def _feature_daily_start(con: duckdb.DuckDBPyConnection, settings: Settings) -> 
     if latest_feat is None:
         row = con.execute("SELECT min(date) FROM prices_daily").fetchone()
         return row[0] if row and row[0] else latest_price
-    return calendar.sessions_ago(latest_price, FEATURE_DAILY_OVERLAP_SESSIONS)
+    overlap = calendar.sessions_ago(latest_price, FEATURE_DAILY_OVERLAP_SESSIONS)
+    floor = calendar.sessions_ago(latest_price, FEATURE_MISSING_ROW_BACKFILL_SESSIONS)
+    names = {r[0] for r in con.execute("SHOW TABLES").fetchall()}
+    if "features_daily" not in names or "tracked_securities" not in names:
+        return overlap
+    missing = con.execute(
+        """
+        SELECT min(p.date)
+        FROM prices_daily p
+        JOIN tracked_securities t
+          ON t.security_id = p.security_id AND t.enabled = TRUE AND t.feature_tracking = TRUE
+        LEFT JOIN features_daily f
+          ON f.security_id = p.security_id AND f.date = p.date
+        WHERE f.security_id IS NULL
+          AND p.date >= ?
+        """,
+        [floor],
+    ).fetchone()
+    missing_min = missing[0] if missing and missing[0] else None
+    if missing_min is None:
+        return overlap
+    return min(overlap, missing_min)
 
 
 def _label_daily_start(con: duckdb.DuckDBPyConnection, settings: Settings) -> date | None:
@@ -79,8 +109,86 @@ def _label_daily_start(con: duckdb.DuckDBPyConnection, settings: Settings) -> da
     return calendar.sessions_ago(latest_price, settings.label_recompute_sessions)
 
 
+def _latest_label_date(con: duckdb.DuckDBPyConnection, settings: Settings) -> date | None:
+    create_lake_views(con, settings)
+    ds = get_lake_dataset(settings.lake_dir, "labels_forward_returns")
+    if not ds.has_any_files():
+        return None
+    row = con.execute("SELECT max(date) FROM labels_forward_returns").fetchone()
+    return row[0] if row and row[0] else None
+
+
+def _missing_feature_identity_min(con: duckdb.DuckDBPyConnection, settings: Settings) -> date | None:
+    latest_price = _latest_price_date(con, settings)
+    if latest_price is None:
+        return None
+    calendar = MarketCalendarService(settings.market_calendar, settings.market_data_grace_minutes)
+    floor = calendar.sessions_ago(latest_price, FEATURE_MISSING_ROW_BACKFILL_SESSIONS)
+    names = {r[0] for r in con.execute("SHOW TABLES").fetchall()}
+    if "features_daily" not in names or "tracked_securities" not in names:
+        return None
+    missing = con.execute(
+        """
+        SELECT min(p.date)
+        FROM prices_daily p
+        JOIN tracked_securities t
+          ON t.security_id = p.security_id AND t.enabled = TRUE AND t.feature_tracking = TRUE
+        LEFT JOIN features_daily f
+          ON f.security_id = p.security_id AND f.date = p.date
+        WHERE f.security_id IS NULL
+          AND p.date >= ?
+        """,
+        [floor],
+    ).fetchone()
+    return missing[0] if missing and missing[0] else None
+
+
+def _skip_features_no_new_prices(con: duckdb.DuckDBPyConnection, settings: Settings, prices: PriceSyncResult) -> bool:
+    if not prices.provider_fetch_skipped and prices.rows_written > 0:
+        return False
+    if not prices.provider_fetch_skipped and prices.fetch_targets > 0:
+        return False
+    latest_price = _latest_price_date(con, settings)
+    latest_feat = _latest_feature_date(con, settings)
+    if latest_price is None or latest_feat is None or latest_feat < latest_price:
+        return False
+    return _missing_feature_identity_min(con, settings) is None
+
+
+def _skip_labels_no_new_sessions(con: duckdb.DuckDBPyConnection, settings: Settings, prices: PriceSyncResult) -> bool:
+    if not _skip_features_no_new_prices(con, settings, prices):
+        return False
+    latest_price = _latest_price_date(con, settings)
+    latest_label = _latest_label_date(con, settings)
+    if latest_price is None or latest_label is None:
+        return False
+    return latest_label >= latest_price
+
+
+def _record_price_metrics(out: DailyPipelineResult, prices: PriceSyncResult) -> None:
+    out.price_symbols_requested = prices.symbols_requested
+    out.price_symbols_skipped_current = prices.current
+    out.price_batches_requested = prices.batches_requested
+    out.price_rows_received = prices.rows_received
+    out.price_provider_fetch_count = prices.provider_fetch_count
+
+
+def _prices_step_message(prices: PriceSyncResult) -> str:
+    fast = format_price_fast_path(prices)
+    if prices.tracked_targets == 0:
+        return prices.message or "SKIPPED - tracked universe is empty (use 'stockdb universe add')"
+    if prices.provider_fetch_skipped:
+        return f"{prices.message}; {fast}"
+    if prices.dry_run:
+        return f"would fetch {prices.fetch_targets} of {prices.tracked_targets} tracked securities; {fast}"
+    return (
+        f"ok ({prices.successful}/{prices.fetch_targets or prices.total_symbols}, "
+        f"{prices.rows_written} rows); {fast}"
+    )
+
+
 def run_daily_pipeline(
-    settings: Settings, con: duckdb.DuckDBPyConnection, dry_run: bool = False
+    settings: Settings, con: duckdb.DuckDBPyConnection, dry_run: bool = False, now=None  # noqa: ANN001
 ) -> DailyPipelineResult:
     out = DailyPipelineResult(dry_run=dry_run)
 
@@ -97,14 +205,11 @@ def run_daily_pipeline(
         logger.exception("run-daily: universe sync failed")
         add("universe", f"FAILED: {exc}", failed=True)
 
+    price_result: PriceSyncResult | None = None
     try:
-        r = sync_recent_prices(settings, con, None, 10, dry_run)
-        if r.total_symbols == 0:
-            add("prices", "SKIPPED - tracked universe is empty (use 'stockdb universe add')")
-        elif r.dry_run:
-            add("prices", f"would check/update {r.total_symbols} tracked securities")
-        else:
-            add("prices", f"ok ({r.successful}/{r.total_symbols}, {r.rows_written} rows)")
+        price_result = sync_recent_prices(settings, con, None, None, dry_run, now=now)
+        _record_price_metrics(out, price_result)
+        add("prices", _prices_step_message(price_result))
     except Exception as exc:  # noqa: BLE001
         logger.exception("run-daily: price sync failed")
         add("prices", f"FAILED: {exc}", failed=True)
@@ -145,8 +250,16 @@ def run_daily_pipeline(
         if summary.scope_size == 0:
             add("price_validation", "SKIPPED - tracked universe is empty")
         else:
-            msg = f"{summary.issues_found} issues ({summary.critical} critical) over {summary.scope_size} securities"
-            if summary.critical > 0 and not dry_run:
+            research_crit = 0
+            if not dry_run:
+                from app.services.price_audit_service import audit_prices
+
+                research_crit = audit_prices(settings, con).research_critical
+            msg = (
+                f"{summary.issues_found} issues ({summary.critical} all-provider critical, "
+                f"{research_crit} research-common unexplained) over {summary.scope_size} securities"
+            )
+            if research_crit > 0 and not dry_run:
                 add("price_validation", msg, failed=True, abort=True)
                 return out
             add("price_validation", msg)
@@ -159,6 +272,8 @@ def run_daily_pipeline(
     try:
         if feat_start is None:
             add("features", "SKIPPED - no price data")
+        elif price_result is not None and _skip_features_no_new_prices(con, settings, price_result):
+            add("features", "SKIPPED - no new price sessions")
         else:
             r = compute_features(settings, con, None, feat_start, None, resume=False, dry_run=dry_run)
             if r.dry_run:
@@ -173,6 +288,8 @@ def run_daily_pipeline(
     try:
         if label_start is None:
             add("labels", "SKIPPED - no price data")
+        elif price_result is not None and _skip_labels_no_new_sessions(con, settings, price_result):
+            add("labels", "SKIPPED - no new price sessions")
         else:
             r = compute_labels(settings, con, None, label_start, None, resume=False, dry_run=dry_run)
             if r.dry_run:

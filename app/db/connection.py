@@ -42,3 +42,32 @@ def duckdb_connection(settings: Settings, read_only: bool = False) -> Iterator[d
         yield con
     finally:
         con.close()
+
+
+@contextmanager
+def analytics_connection(settings: Settings) -> Iterator[duckdb.DuckDBPyConnection]:
+    """In-memory DuckDB that ATTACH-es the catalog read-only.
+
+    Lake views created on this connection stay in memory. The on-disk
+    catalog file is not opened for write.
+    """
+    mem = duckdb.connect(":memory:")
+    mem.execute(f"SET memory_limit = '{settings.duckdb_memory_limit}'")
+    mem.execute(f"SET threads = {int(settings.duckdb_threads)}")
+    path = str(settings.duckdb_path).replace("'", "''")
+    mem.execute(f"ATTACH '{path}' AS catalog (READ_ONLY)")
+    tables = mem.execute(
+        """
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_catalog = 'catalog'
+          AND table_schema = 'main'
+          AND table_type = 'BASE TABLE'
+        """
+    ).fetchall()
+    for (name,) in tables:
+        mem.execute(f'CREATE VIEW "{name}" AS SELECT * FROM catalog."{name}"')
+    try:
+        yield mem
+    finally:
+        mem.close()

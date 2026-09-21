@@ -122,6 +122,32 @@ _DDL_STATEMENTS: list[str] = [
         notes             TEXT
     )
     """,
+    # Heuristic instrument classes. Not a complete security master
+    # (instrument_class_complete=false). A security may be AMBIGUOUS.
+    """
+    CREATE TABLE IF NOT EXISTS instrument_classifications (
+        security_id                 TEXT PRIMARY KEY,
+        ticker                      TEXT,
+        instrument_class            TEXT NOT NULL,
+        classification_source       TEXT NOT NULL,
+        classification_confidence   TEXT NOT NULL,
+        exclusion_reason            TEXT,
+        updated_at                  TIMESTAMP NOT NULL
+    )
+    """,
+    # Named universes (scale-test vs research common equity vs benchmark).
+    # Distinct from tracked_securities: one security can belong to several.
+    """
+    CREATE TABLE IF NOT EXISTS universe_memberships (
+        universe_name       TEXT NOT NULL,
+        security_id         TEXT NOT NULL,
+        universe_type       TEXT NOT NULL,
+        selection_version   TEXT NOT NULL,
+        selection_rule      TEXT NOT NULL,
+        added_at            TIMESTAMP NOT NULL,
+        PRIMARY KEY (universe_name, security_id)
+    )
+    """,
     # --- research-integrity / survivorship-bias metadata ---------------------------
     # Machine-readable counterpart to the README limitations section, so a future
     # features/labels/backtest layer can programmatically check e.g.
@@ -142,6 +168,8 @@ _INDEXES: list[str] = [
     "CREATE INDEX IF NOT EXISTS idx_source_files_run_id ON source_files(run_id)",
     "CREATE INDEX IF NOT EXISTS idx_security_identifiers_value ON security_identifiers(identifier_value)",
     "CREATE INDEX IF NOT EXISTS idx_dqi_dataset ON data_quality_issues(dataset, resolved)",
+    "CREATE INDEX IF NOT EXISTS idx_universe_memberships_type ON universe_memberships(universe_type, universe_name)",
+    "CREATE INDEX IF NOT EXISTS idx_instrument_class ON instrument_classifications(instrument_class)",
 ]
 
 
@@ -162,7 +190,9 @@ def create_lake_views(con: duckdb.DuckDBPyConnection, settings) -> None:  # noqa
     (not created) for datasets that have no Parquet files yet.
 
     ``research_daily`` is a convenience join of features + labels. Feature
-    calculation code must not read it.
+    calculation code must not read it. ``research_common_equity_daily_v1``
+    is the analysis sample (RESEARCH_COMMON_EQUITY only; no benchmark ETF
+    rows).
     """
     from app.config.lake_datasets import get_lake_dataset, get_spec, implemented_dataset_keys
 
@@ -191,6 +221,9 @@ def create_lake_views(con: duckdb.DuckDBPyConnection, settings) -> None:  # noqa
         created.add(name)
 
     _create_research_daily_view(con, created)
+    from app.research.dataset import create_research_common_equity_view
+
+    create_research_common_equity_view(con, created)
 
 
 def _create_research_daily_view(con: duckdb.DuckDBPyConnection, created: set[str]) -> None:

@@ -279,7 +279,8 @@ stockdb backfill-prices --start 2000-01-01 --batch-size 50 --resume
 ## 8. Daily incremental updates
 
 ```bash
-stockdb sync-prices          # refreshes a trailing 10-day window for the TRACKED price universe
+stockdb sync-prices          # daily fast path: only STALE/NO_DATA tracked names; skip if already current
+stockdb repair-prices        # weekly repair: re-fetch last PRICE_REPAIR_LOOKBACK_SESSIONS for tracked names
 stockdb run-daily            # universe -> prices -> vix -> macro -> filings -> validate -> report
 ```
 
@@ -301,7 +302,8 @@ and then skips each one in a loop" (an earlier bug). Example output:
 
 ```
 Universe    would sync SEC universe + ETF seed list (10438 securities known)
-Prices      would check/update 9 tracked securities
+Prices      SKIPPED - all 9 tracked securities already current through YYYY-MM-DD
+            (or: would fetch N of 9 if any are STALE/NO_DATA)
 VIX         would fetch latest VIX
 Macro       SKIPPED - FRED_API_KEY not configured
 Filings     would check 9 tracked CIK(s)
@@ -340,17 +342,29 @@ crontab -e
 `scripts/run_daily.sh`, and a `run-daily.timer` with `OnCalendar=*-*-* 09:00:00`,
 then `systemctl enable --now run-daily.timer`.
 
-**Windows (Task Scheduler):** do **not** auto-register. From an elevated
-PowerShell session, after reviewing `STOCKDB_DAILY_TIME` (default `09:00`,
-machine local time -- on a Seoul box that is well after the US cash close):
+**Windows (Task Scheduler):** do **not** auto-register. Run `uv run stockdb doctor`
+first; register only when doctor has zero FAIL items and a same-session second
+`run-daily` is logically idempotent. From an elevated PowerShell session,
+after reviewing `STOCKDB_DAILY_TIME` (default `09:00`, **machine local time**
+— Windows Task Scheduler does not use a Python timezone. On a Seoul box 09:00
+is well after the US cash close plus provider EOD lag):
 
 ```powershell
 .\scripts\register_daily_task.ps1
 .\scripts\unregister_daily_task.ps1
 ```
 
-Administrator rights are typically required. Timezone is never hardcoded in
-Python; the Task Scheduler uses the machine's local clock.
+`scripts/run_daily.ps1` sets `WorkingDirectory` to the project root via
+`-LiteralPath` (Korean characters and spaces in the path are supported) and
+invokes:
+
+```
+uv run python -m app.cli.main run-daily
+```
+
+not `stockdb.exe` (App Control has blocked that shim on some Windows
+installs). Administrator rights are typically required. Timezone is never
+hardcoded in Python; the Task Scheduler uses the machine's local clock.
 
 ---
 
@@ -406,6 +420,39 @@ WHERE ticker = 'AAPL'
 ORDER BY date DESC
 LIMIT 30;
 ```
+
+The **research sample** is `research_common_equity_daily_v1`: RESEARCH_COMMON_EQUITY
+membership only (default `research-common-equity-500`). Benchmark ETFs are market
+context columns, not stock-sample rows. Critical unresolved price-quality rows
+have `data_quality_valid = false` and are excluded from analysis by default.
+Raw lake files are never rewritten by research commands.
+
+**Time split (no snooping):** feature exploration and any freezeable cutoff
+(e.g. VIX tertiles) use **development** `2018-01-01`–`2023-12-31` only.
+**Validation** `2024-01-01`–latest is a holdout. Validation numbers are reported
+and must not be used to retune development rules. Cross-sectional quintiles are
+assigned **within each trading date**, so they do not use the future distribution.
+
+```bash
+uv run stockdb research reconcile
+uv run stockdb research baseline --split development
+uv run stockdb research feature-coverage --split development
+uv run stockdb research quantiles --feature rel_spy_20d --split development
+uv run stockdb research ic --feature rel_spy_20d --split development
+uv run stockdb research regimes --feature rel_spy_20d --split development
+uv run stockdb research report --version v1
+```
+
+Outputs go to `data/research/v1/` (parquet + provenance columns). These are
+research statistics (quintile means, medians, development-frozen 1% winsor
+means, rank IC, Q5–Q1 spreads, price-bucket overlays). Winsor cutoffs are
+frozen from development (`robust_cutoffs.parquet`) and applied unchanged to
+validation; original lake labels are never clipped. These outputs are **not**
+buy/sell recommendations, rankings, or portfolio weights.
+
+Lake distinct security counts and tracked-universe size are different metrics.
+`stockdb status` prints both. Tracked can be larger than the lake when some
+tracked names (typically unused sector ETFs) have no price files.
 
 ### Research-scale expansion (not an investment universe)
 
@@ -466,24 +513,41 @@ directory skeleton at the new location. Nothing else needs to change.
 | `stockdb init` | Create directories + DuckDB schema + seed config data. |
 | `stockdb sync-universe [--dry-run]` | Sync security master from SEC + ETF seed list. |
 | `stockdb backfill-prices --start DATE [--symbols A,B,C] [--tracked] [--all-active] [--end DATE] [--batch-size N] [--resume] [--dry-run]` | Backfill daily price history. |
-| `stockdb sync-prices [--symbols ...] [--lookback-days N] [--dry-run]` | Incremental daily price refresh for the tracked universe. |
+| `stockdb sync-prices [--symbols ...] [--dry-run]` | Daily price fast path for the tracked universe. Skips names already current through the expected XNYS session. |
+| `stockdb repair-prices [--lookback-sessions N] [--dry-run]` | Weekly repair: re-fetch recent XNYS sessions for every tracked price target (not the full master). |
 | `stockdb sync-macro [--series ...] [--start DATE] [--dry-run]` | Sync FRED macro series. |
 | `stockdb sync-vix [--dry-run]` | Sync official Cboe VIX history. |
 | `stockdb sync-sec-filings [--ciks ...] [--dry-run]` | Sync SEC filing metadata (10-K/10-Q/8-K/20-F/6-K) for the tracked (filings-enabled) CIKs. |
 | `stockdb compute-features --start DATE [--symbols ...] [--end DATE] [--version v1] [--resume] [--dry-run]` | Compute `features_daily` for the feature-tracking universe. |
 | `stockdb compute-labels --start DATE [--symbols ...] [--end DATE] [--version v1] [--resume] [--dry-run]` | Compute `labels_forward_returns` (session horizons; immature = null). |
-| `stockdb expand-universe --research-scale 100\|500 [--dry-run]` | Deterministic scale-test universe (not an investment universe). |
+| `stockdb expand-universe --research-scale 100\|500 [--dry-run]` | Deterministic PROVIDER_SCALE_TEST universe (not an investment universe). |
+| `stockdb expand-universe --research-common-equity 100\|500 [--dry-run]` | Deterministic RESEARCH_COMMON_EQUITY universe. Benchmarks stay separate. |
 | `stockdb expand-universe --all-active [--dry-run]` | Register every active security as tracked. Does **not** start a backfill. |
 | `stockdb validate prices [--symbols ...] [--all-universe] [--dry-run]` | Run data-quality checks (tracked universe by default). |
 | `stockdb validate features [--symbols ...] [--dry-run]` | Feature validation (RSI bounds, negative ATR/vol, inf). |
 | `stockdb validate labels [--symbols ...] [--dry-run]` | Label validation (return < -1, extremes). Never winsorizes. |
-| `stockdb compact prices [--year Y --month M] [--dry-run]` | Merge small Parquet files into one per partition (also: `macro`, `volatility`, `filings`, `features`, `labels`). |
+| `stockdb audit prices` | Split OHLC critical/warning into research-common vs non-common; count rounding vs true violations. |
+| `stockdb audit extreme-labels` | Classify EXTREME_LABEL warnings (does not raise the threshold). |
+| `stockdb research reconcile` | Lake vs tracked vs named-universe security coverage. |
+| `stockdb research baseline [--split development\|validation]` | Unconditional forward-return / SPY-excess baseline. |
+| `stockdb research feature-coverage [--split ...]` | Null ratios and distribution of v1 features. |
+| `stockdb research quantiles --feature NAME [--split ...]` | Date-by-date cross-sectional quintiles. |
+| `stockdb research ic [--feature NAME] [--split ...]` | Spearman rank IC by date, then mean/IR. |
+| `stockdb research regimes --feature NAME [--split ...]` | Quintiles sliced by SPY-vs-MA200 and frozen VIX tertiles. |
+| `stockdb research report --version v1 [--features a,b]` | Write `data/research/v1/*.parquet` including robust/winsor (dev-frozen cutoffs), price overlays, and feature rank correlation. Validation is not used to retune. |
+| `stockdb compact prices [--year Y --month M] [--dry-run] [--verify/--no-verify]` | Merge partition files (omit year/month for the whole prices dataset). `--verify` is the default. |
 | `stockdb storage-health [--dataset NAME]` | Show per-partition file/size stats and flag compaction candidates. |
 | `stockdb universe tracked [--include-disabled]` | List the tracked (operational) universe. |
 | `stockdb universe add TICKER... [--reason TEXT] [--no-filings]` | Add tickers to the tracked universe. |
 | `stockdb universe remove TICKER...` | Soft-remove tickers from the tracked universe (history kept). |
-| `stockdb status` | Show DB/lake/job status as Rich tables. |
+| `stockdb status` | Show DB/lake/job status as Rich tables (dates include English weekday; daily target vs known master). |
+| `stockdb doctor` | Pre-scheduler environment check (OK/WARN/FAIL). Does not print secrets. Does not register Task Scheduler. |
 | `stockdb run-daily [--dry-run]` | Daily pipeline: universe → prices → VIX → FRED → filings → validate → incremental features → recent labels → validate. |
+| `stockdb indicators list [--group ...]` | List on-demand technical indicators (memory-only). |
+| `stockdb indicators show --symbol TICKER [--start] [--end] [--group] [--indicator] [--all] [--tail N]` | Compute indicators in memory and print a table. Never writes files. |
+| `stockdb mine run [--target] [--analysis-start/end] [--validation-start/end] [--event-mode state\|entry] [--cooldown-sessions N] [--max-rule-size 2] [--top 30]` | Discover on ANALYSIS; evaluate the frozen set on VALIDATION. No files written. Not recommendations. |
+| `stockdb mine walk-forward [--target] [--full-discover] [--event-mode] [--cooldown-sessions]` | Expanding-window walk-forward. Fold cutoffs freeze on that fold. FUTURE_HOLDOUT is not evaluated. |
+| `stockdb mine inspect --pattern NAME [--pattern NAME]` | STATE vs ENTRY vs cooldown, parent incremental, episodes, years, price/regime. Terminal only. |
 
 ---
 
@@ -503,6 +567,9 @@ stock-pattern-db/
     validation/       # data-quality rules + runner
     services/         # status report, compaction, provenance/manifest bookkeeping
     cli/              # Typer CLI wiring only -- no business logic
+    research/         # Univariate research stats (not recommendations)
+    indicators/       # On-demand TA engine (memory-only; no lake writes)
+    mining/           # Ephemeral pattern discovery + holdout eval (no result files)
     utils/            # logging, rate limiting, atomic I/O, Parquet lake read/write
 
   data/
@@ -516,6 +583,8 @@ stock-pattern-db/
       short_volume/
       features_daily/
       labels_forward_returns/
+    research/        # analysis outputs (never mixed into the lake)
+      v1/
     state/           # DuckDB catalog + checkpoints
     logs/            # rotating log files
 
@@ -533,6 +602,8 @@ stock-pattern-db/
 * `symbol_mappings` -- canonical ticker <-> provider-specific spelling overrides.
 * `data_quality_issues` -- validation findings (dataset, security_id, date, issue_type, severity, resolved). Rows are marked `resolved`, never deleted, once a finding no longer reproduces on a subsequent validation run.
 * `tracked_securities` -- the operational subset of `securities` that daily jobs/validation run against (`enabled`, `price_tracking`, `filings_tracking`, `feature_tracking`, `tracking_reason`, `added_at`/`removed_at`). See section 5.1.
+* `instrument_classifications` -- heuristic instrument class per security (`instrument_class_complete=false`).
+* `universe_memberships` -- named universes (`research-scale-N`, `research-common-equity-N`, `benchmark-etf-seed`) with `universe_type`.
 * `dataset_metadata` -- machine-readable research-integrity flags per dataset (`dataset_name`, `metadata_key`, `metadata_value`). See section 17.
 
 ### Parquet partitioning strategy
@@ -540,18 +611,61 @@ stock-pattern-db/
 * Hive-style `year=YYYY/month=MM/` partitions per dataset.
 * Files within a partition are sorted by `(security_id, date)` (or the
   dataset's natural key) and written with ZSTD compression.
+* Price (and daily-sync) writes are **batch-then-partition**: a 25-symbol
+  batch is concatenated, then `write_increment` emits **one file per
+  month partition per batch**, not one file per symbol. Atomic write,
+  provenance, append, and last-write-wins dedup are unchanged.
 * Each ingestion run **appends** a new file to the partitions it touched --
   it never rewrites an entire partition on every ingest (which would make a
   long backfill O(n^2) in total I/O). This means the same logical row can
   briefly exist in more than one file after re-ingestion; every DuckDB view
   over the lake applies a "last write wins" dedup (`ORDER BY retrieved_at DESC`)
   so queries are always correct.
-* `stockdb compact <dataset> [--year Y --month M]` physically merges a
-  partition's files into one, dropping the superseded duplicate rows. Run
-  this periodically (e.g. weekly, or as part of a maintenance script) once a
-  partition has accumulated many small files.
+* `stockdb compact prices` (omit `--year/--month` to compact every monthly
+  partition) physically merges a partition's files into one, dropping
+  superseded duplicate rows. Compaction is temp-write → validate → atomic
+  replace → delete old files. `--verify` (default) checks that logical
+  rows, security count, min/max date, and duplicate count are unchanged.
 * All writes are temp-file -> validate -> atomic `os.replace()`, so a crash
   mid-write can never corrupt or truncate existing data.
+
+### OHLC numeric tolerance
+
+Price bars are floats. v1 treats
+
+```
+tol(a, b) = max(0.001, 1e-5 * max(|a|, |b|, 1.0))
+approximately_ge(a, b)  iff  a + tol(a,b) >= b
+```
+
+A $24 preferred with `low = open + 0.0001` is `OHLC_ROUNDING_TOLERANCE`
+(info), not critical. A warrant bar with `high=10.08` vs `open=10.15` stays
+`OHLC_INCONSISTENT` (critical). Raw prices are never auto-corrected.
+True-invalid OHLC rows keep the price bar; ATR / gap / range / wick /
+high-low-distance features on that row are set to null.
+
+### Universes
+
+* `KNOWN` -- the SEC security master (`securities`).
+* `PROVIDER_SCALE_TEST` -- `research-scale-N` hash sample (may include
+  warrants/preferred). Engineering scale test, not the research target.
+* `RESEARCH_COMMON_EQUITY` -- `research-common-equity-N`. Active NYSE/Nasdaq/CBOE
+  names classified as common equity. No performance-based selection.
+* `BENCHMARK` -- curated ETF seed (SPY, QQQ, IWM, DIA, sector ETFs, ...).
+
+Instrument classification (`instrument_class_complete=false`) uses SEC
+metadata first, ticker suffix last:
+
+1. `SEC_SECURITY_TITLE` -- official listing/prospectus title when known
+   (e.g. junior subordinated debentures → `DEBT`).
+2. `SEC_REGISTRANT_TYPE` -- investment-company SEC forms (N-2/N-CSR/...)
+   and registrant-name patterns (municipal income trust, closed-end, ...)
+   → `CLOSED_END_FUND` / `FUND`.
+3. Ticker-suffix heuristics (warrant/preferred/unit/right).
+4. Simple US ticker → `COMMON_EQUITY` at medium confidence.
+
+Ambiguous 5-letter `*W` names are not forced to COMMON_EQUITY. Raw prices
+are never rewritten when a class changes.
 
 ### Providers implemented
 
@@ -718,3 +832,45 @@ relying on someone having read section 13. `research_only_price_provider`
 (shown inverted as "Commercial use safe") is derived automatically from the
 active `PRICE_PROVIDER`'s `ProviderCapabilities.commercial_use_safe` --
 switching providers updates this the next time any command runs.
+
+---
+
+## 18. On-demand indicators and ephemeral mining
+
+These engines **read** `prices_daily` / `features_daily` / `labels_forward_returns`.
+They **do not write** Parquet, CSV, DuckDB tables, `data/research`, manifests, or checkpoints.
+
+```
+INDICATOR_PERSISTENCE_ENABLED=false
+MINING_RESULT_PERSISTENCE_ENABLED=false
+```
+
+Adjustment matches the feature engine: `factor = adj_close / close`. Invalid factor → indicator nulls (no silent raw-close fallback).
+
+### Indicator notes
+
+- **Ichimoku:** `cloud_a_at_t` / `cloud_b_at_t` are Senkou A/B computed 26 sessions earlier. Visual Chikou (`visual_chikou_shifted`) is `causal_safe=false` and excluded from mining. Use `close_vs_close_26` instead.
+- **Donchian / prior high-low breakouts:** threshold is the previous N-session high/low (`shift(1)`). The current bar is not in the breakout channel.
+- **Pivots:** Classic / Fibonacci / Camarilla / Woodie from the **prior** session OHLC only.
+- **Bollinger/Keltner squeeze:** `squeeze_on` when BB(20,2) lies entirely inside KC(EMA20, ATR10×2). `squeeze_release` is the first session `squeeze_on` becomes false.
+- **Rolling VWAP:** daily typical price × volume over N bars. This is **not** an intraday session VWAP.
+- **Rolling Fibonacci 60:** levels of the last 60-session high/low range. Not a manual swing retracement.
+- **Candlesticks:** project rules, not TA-Lib clones. Doji body ≤ 10% of range. Hammer lower wick ≥ 2× body and upper wick ≤ 0.3× body. Engulfing uses close/open containment. Morning/evening star: two-session-ago long bar, small middle, reversal close through the midpoint.
+
+### Mining
+
+Default ANALYSIS `2018-01-02`–`2023-12-29`. The later window is **VALIDATION** (`2024-01-02`–latest mature date). It was previously labeled TEST; the dates did not change. Ranges must not overlap; VALIDATION is later.
+
+`FUTURE_HOLDOUT` starts `2026-09-21`. v1 does not evaluate it. Quantile cutoffs, candidate selection, and winsor p1/p99 freeze on the discover window (`PATTERN_FREEZE_POLICY`). VALIDATION / walk-forward eval years / FUTURE_HOLDOUT must not retune them.
+
+`--event-mode state` uses every true day. `--event-mode entry` uses false→true only. `--cooldown-sessions N` is an event robustness filter (same security is not counted again for N sessions). Episodes are consecutive true runs in memory (not stored).
+
+Walk-forward expanding windows freeze cutoffs on each fold's discover period, then evaluate the next calendar year only.
+
+Pair rules also report incremental effect vs each parent and Jaccard overlap (`HIGH_OVERLAP` when P(B\|A)>0.95 or Jaccard>0.90).
+
+Support defaults: 1000 rows, 100 dates, 30 securities. FDR is Benjamini-Hochberg on ANALYSIS same-date CS contrast p-values (`q ≤ 0.10` by default). Date-clustered means use lag = horizon.
+
+Price-floor and SPY/VIX regime slices are robustness audits of already-selected patterns. They do not retune thresholds.
+
+This is not a trading system.

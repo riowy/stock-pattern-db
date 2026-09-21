@@ -108,9 +108,18 @@ def test_idempotent_feature_query_and_research_daily(con, settings) -> None:
     _write_prices(settings, "SPY1", "SPY", n=40)
 
     r1 = compute_features(settings, con, None, date(2024, 1, 2), date(2024, 2, 15), version=FEATURE_VERSION_V1)
+    create_lake_views(con, settings)
+    n_before = con.execute(
+        "SELECT count(*) FROM (SELECT DISTINCT security_id, date FROM features_daily)"
+    ).fetchone()[0]
     r2 = compute_features(settings, con, None, date(2024, 1, 2), date(2024, 2, 15), version=FEATURE_VERSION_V1)
+    create_lake_views(con, settings)
+    n_after = con.execute(
+        "SELECT count(*) FROM (SELECT DISTINCT security_id, date FROM features_daily)"
+    ).fetchone()[0]
     assert r1.rows_written > 0
     assert r2.rows_written > 0
+    assert n_after == n_before
 
     compute_labels(settings, con, None, date(2024, 1, 2), date(2024, 2, 15), version=LABEL_VERSION_V1)
     create_lake_views(con, settings)

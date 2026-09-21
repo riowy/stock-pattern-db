@@ -305,3 +305,59 @@ def test_sector_relative_is_null() -> None:
     assert row["rel_sector_5d"] is None
     assert row["rel_sector_20d"] is None
     assert row["rel_sector_60d"] is None
+
+
+def test_invalid_ohlc_nulls_dependent_features_keeps_close_returns() -> None:
+    dates = _dates(20)
+    close = [10.0 + 0.1 * i for i in range(20)]
+    high = [c + 1 for c in close]
+    low = [c - 1 for c in close]
+    open_ = list(close)
+    # True violation on last bar: high well below open.
+    high[-1] = close[-1] - 0.5
+    prices = _bars("S1", "AAA", dates, close, high=high, low=low, open_=open_)
+    feats = FeatureEngine().calculate_features(prices, dates[-1], dates[-1], security_ids=["S1"])
+    row = feats.row(0, named=True)
+    assert row["atr_14"] is None
+    assert row["atr_pct_14"] is None
+    assert row["gap_return"] is None
+    assert row["intraday_return"] is None
+    assert row["daily_range_pct"] is None
+    assert row["upper_wick_pct"] is None
+    assert row["lower_wick_pct"] is None
+    assert row["distance_high_20d"] is None
+    assert row["ret_1d"] is not None
+
+
+def test_rounding_ohlc_does_not_null_features() -> None:
+    dates = _dates(20)
+    close = [24.2] * 20
+    prices = _bars(
+        "S1",
+        "FGN",
+        dates,
+        close,
+        high=[24.2000] * 20,
+        low=[24.2001] * 20,
+        open_=[24.2000] * 20,
+    )
+    feats = FeatureEngine().calculate_features(prices, dates[-1], dates[-1], security_ids=["S1"])
+    row = feats.row(0, named=True)
+    assert row["atr_14"] is not None or row["daily_range_pct"] is not None
+
+
+def test_normal_symbol_feature_label_regression_columns() -> None:
+    dates = _dates(40)
+    aapl_close = [150.0 + i * 0.2 for i in range(40)]
+    spy_close = [400.0 + i * 0.1 for i in range(40)]
+    aapl = _bars("AAPL1", "AAPL", dates, aapl_close)
+    spy = _bars("SPY1", "SPY", dates, spy_close)
+    prices = pl.concat([aapl, spy])
+    t0, t1 = dates[25], dates[30]
+    feats_a = FeatureEngine().calculate_features(prices, t0, t1, security_ids=["AAPL1"])
+    feats_b = FeatureEngine().calculate_features(prices, t0, t1, security_ids=["AAPL1"])
+    labs_a = LabelEngine().calculate_labels(prices, t0, t1, security_ids=["AAPL1"])
+    labs_b = LabelEngine().calculate_labels(prices, t0, t1, security_ids=["AAPL1"])
+    for col in ("ret_20d", "rsi_14", "volume_ratio_20d", "rel_spy_20d"):
+        assert feats_a[col].to_list() == pytest.approx(feats_b[col].to_list(), nan_ok=True)
+    assert labs_a["forward_return_10d"].to_list() == pytest.approx(labs_b["forward_return_10d"].to_list(), nan_ok=True)

@@ -24,6 +24,10 @@ class UniverseStatus:
     active_securities: int = 0
     tracked_securities: int = 0
     tracked_for_prices: int = 0
+    research_common_equities: int = 0
+    provider_scale_test_extras: int = 0
+    benchmarks: int = 0
+    total_tracked_price_targets: int = 0
 
 
 @dataclass
@@ -31,6 +35,7 @@ class PricesStatus:
     total_rows_estimate: int = 0
     earliest_date: str | None = None
     latest_date: str | None = None
+    lake_distinct_securities: int = 0
     tracked_current: int = 0
     tracked_stale: int = 0
     tracked_no_data: int = 0
@@ -54,6 +59,7 @@ class SecStatus:
     last_filing_retrieved_at: str | None = None
     filings_tracked: int = 0
     tracked_ciks: int = 0
+    user_agent_configured: bool = False
 
 
 @dataclass
@@ -91,15 +97,22 @@ class ResearchIntegrityStatus:
 class FeaturesStatus:
     rows: int = 0
     latest_date: str | None = None
+    lake_distinct_securities: int = 0
     tracked_current: int = 0
     tracked_stale: int = 0
+    tracked_no_data: int = 0
 
 
 @dataclass
 class LabelsStatus:
     rows: int = 0
     latest_date: str | None = None
+    lake_distinct_securities: int = 0
     latest_mature_horizon: str | None = None
+    latest_mature_1d: str | None = None
+    latest_mature_5d: str | None = None
+    latest_mature_10d: str | None = None
+    latest_mature_20d: str | None = None
     recent_null_expected: bool = True
 
 
@@ -150,11 +163,18 @@ def gather_status(settings: Settings, con: duckdb.DuckDBPyConnection) -> StatusR
         "SELECT count(*), sum(CASE WHEN price_tracking THEN 1 ELSE 0 END) "
         "FROM tracked_securities WHERE enabled = TRUE"
     ).fetchone()
+    from app.research.dataset import daily_collection_scope, label_maturity_dates
+
+    scope = daily_collection_scope(con)
     universe = UniverseStatus(
         total_known_securities=total_known or 0,
         active_securities=active_sec or 0,
         tracked_securities=tracked_total or 0,
         tracked_for_prices=tracked_price_count or 0,
+        research_common_equities=scope.get("research_common_equity_500", 0),
+        provider_scale_test_extras=scope.get("provider_scale_test_extras", 0),
+        benchmarks=scope.get("benchmarks", 0),
+        total_tracked_price_targets=scope.get("total_tracked_price_targets", tracked_price_count or 0),
     )
 
     tracked_price_ids = get_tracked_price_security_ids(con)
@@ -162,7 +182,9 @@ def gather_status(settings: Settings, con: duckdb.DuckDBPyConnection) -> StatusR
     calendar = MarketCalendarService(settings.market_calendar, settings.market_data_grace_minutes)
 
     if prices_ds.has_any_files():
-        row_count, min_d, max_d = con.execute("SELECT count(*), min(date), max(date) FROM prices_daily").fetchone()
+        row_count, min_d, max_d, nsec = con.execute(
+            "SELECT count(*), min(date), max(date), count(DISTINCT security_id) FROM prices_daily"
+        ).fetchone()
 
         if tracked_price_ids:
             latest_expected = calendar.latest_expected_session()
@@ -183,6 +205,7 @@ def gather_status(settings: Settings, con: duckdb.DuckDBPyConnection) -> StatusR
             total_rows_estimate=row_count or 0,
             earliest_date=str(min_d) if min_d else None,
             latest_date=str(max_d) if max_d else None,
+            lake_distinct_securities=nsec or 0,
             tracked_current=current,
             tracked_stale=stale,
             tracked_no_data=no_data,
@@ -198,10 +221,10 @@ def gather_status(settings: Settings, con: duckdb.DuckDBPyConnection) -> StatusR
         macro = MacroStatus(
             series_count=series_count or 0,
             last_update=str(last_update) if last_update else None,
-            fred_configured=bool(settings.fred_api_key.strip()),
+            fred_configured=settings.fred_api_key_configured,
         )
     else:
-        macro = MacroStatus(fred_configured=bool(settings.fred_api_key.strip()))
+        macro = MacroStatus(fred_configured=settings.fred_api_key_configured)
 
     vix_ds = get_lake_dataset(settings.lake_dir, "volatility")
     if vix_ds.has_any_files():
@@ -224,9 +247,13 @@ def gather_status(settings: Settings, con: duckdb.DuckDBPyConnection) -> StatusR
             last_filing_retrieved_at=str(last_retrieved) if last_retrieved else None,
             filings_tracked=count or 0,
             tracked_ciks=tracked_cik_count or 0,
+            user_agent_configured=settings.sec_user_agent_configured,
         )
     else:
-        sec = SecStatus(tracked_ciks=tracked_cik_count or 0)
+        sec = SecStatus(
+            tracked_ciks=tracked_cik_count or 0,
+            user_agent_configured=settings.sec_user_agent_configured,
+        )
 
     candidates = compaction_candidates(settings)
     storage = StorageStatus(
@@ -297,7 +324,9 @@ def gather_status(settings: Settings, con: duckdb.DuckDBPyConnection) -> StatusR
     feature_ids = get_tracked_feature_security_ids(con)
     features_ds = get_lake_dataset(settings.lake_dir, "features_daily")
     if features_ds.has_any_files():
-        f_rows, f_max = con.execute("SELECT count(*), max(date) FROM features_daily").fetchone()
+        f_rows, f_max, f_nsec = con.execute(
+            "SELECT count(*), max(date), count(DISTINCT security_id) FROM features_daily"
+        ).fetchone()
         if feature_ids:
             latest_expected = calendar.latest_expected_session()
             cutoff = calendar.sessions_ago(latest_expected, 5)
@@ -308,16 +337,26 @@ def gather_status(settings: Settings, con: duckdb.DuckDBPyConnection) -> StatusR
             ).fetchall()
             last_map = {r[0]: r[1] for r in last_rows}
             f_current = sum(1 for sid in feature_ids if last_map.get(sid) and last_map[sid] >= cutoff)
-            f_stale = len(feature_ids) - f_current
+            f_no_data = sum(1 for sid in feature_ids if sid not in last_map)
+            f_stale = len(feature_ids) - f_current - f_no_data
         else:
-            f_current = f_stale = 0
-        features = FeaturesStatus(rows=f_rows or 0, latest_date=str(f_max) if f_max else None, tracked_current=f_current, tracked_stale=f_stale)
+            f_current = f_stale = f_no_data = 0
+        features = FeaturesStatus(
+            rows=f_rows or 0,
+            latest_date=str(f_max) if f_max else None,
+            lake_distinct_securities=f_nsec or 0,
+            tracked_current=f_current,
+            tracked_stale=f_stale,
+            tracked_no_data=f_no_data,
+        )
     else:
         features = FeaturesStatus()
 
     labels_ds = get_lake_dataset(settings.lake_dir, "labels_forward_returns")
     if labels_ds.has_any_files():
-        l_rows, l_max = con.execute("SELECT count(*), max(date) FROM labels_forward_returns").fetchone()
+        l_rows, l_max, l_nsec = con.execute(
+            "SELECT count(*), max(date), count(DISTINCT security_id) FROM labels_forward_returns"
+        ).fetchone()
         mature = None
         try:
             mature_row = con.execute(
@@ -326,10 +365,16 @@ def gather_status(settings: Settings, con: duckdb.DuckDBPyConnection) -> StatusR
             mature = str(mature_row[0]) if mature_row and mature_row[0] else None
         except Exception:  # noqa: BLE001
             mature = None
+        maturity = label_maturity_dates(settings, con)
         labels = LabelsStatus(
             rows=l_rows or 0,
             latest_date=str(l_max) if l_max else None,
+            lake_distinct_securities=l_nsec or 0,
             latest_mature_horizon=mature,
+            latest_mature_1d=maturity.get("latest_mature_1d"),
+            latest_mature_5d=maturity.get("latest_mature_5d"),
+            latest_mature_10d=maturity.get("latest_mature_10d"),
+            latest_mature_20d=maturity.get("latest_mature_20d"),
             recent_null_expected=True,
         )
     else:

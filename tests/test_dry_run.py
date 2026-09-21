@@ -204,3 +204,7 @@ def test_dry_run_daily_pipeline_includes_feature_label_steps(con, settings, monk
     assert "feature_label_validation" in names
     _assert_no_mutations(con, settings)
     assert not any(settings.lake_dir.rglob("*.parquet"))
+
+    again = run_daily_pipeline(settings, con, dry_run=True)
+    assert [s.name for s in again.steps] == names
+    _assert_no_mutations(con, settings)

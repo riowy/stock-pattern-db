@@ -10,11 +10,14 @@
 # whatever local timezone the machine uses. This script does not hardcode
 # a timezone. For a machine in Asia/Seoul, 09:00 is well after the US
 # cash-session close (16:00 America/New_York) plus provider EOD lag.
+#
+# Paths are resolved with -LiteralPath so Korean characters and spaces in
+# the project directory are preserved. WorkingDirectory is the project root.
 
 $ErrorActionPreference = "Stop"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$ProjectDir = Split-Path -Parent $ScriptDir
+$ProjectDir = (Resolve-Path -LiteralPath (Split-Path -Parent $ScriptDir)).Path
 $Runner = Join-Path $ScriptDir "run_daily.ps1"
 $TaskName = "StockPatternDbDaily"
 
@@ -23,7 +26,7 @@ if (-not $Time) {
     $Time = "09:00"
 }
 
-if (-not (Test-Path $Runner)) {
+if (-not (Test-Path -LiteralPath $Runner)) {
     throw "Daily runner not found: $Runner"
 }
 
@@ -35,4 +38,6 @@ $Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoi
 Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Settings $Settings -Force | Out-Null
 Write-Output "Registered scheduled task '$TaskName' daily at $Time (machine local time)."
 Write-Output "Project: $ProjectDir"
-Write-Output "Unregister with: powershell.exe -ExecutionPolicy Bypass -File `"$ScriptDir\unregister_daily_task.ps1`""
+Write-Output "WorkingDirectory: $ProjectDir"
+Write-Output "Runner: $Runner"
+Write-Output "Unregister with: powershell.exe -ExecutionPolicy Bypass -File `"$(Join-Path $ScriptDir 'unregister_daily_task.ps1')`""

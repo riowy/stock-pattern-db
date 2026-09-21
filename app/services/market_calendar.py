@@ -92,6 +92,10 @@ class MarketCalendarService:
         return cursor
 
     # ------------------------------------------------------------------ "now"
+    def expected_latest_completed_session(self, now: datetime | None = None) -> date:
+        """Alias for ``latest_expected_session`` (close + grace, America/New_York)."""
+        return self.latest_expected_session(now)
+
     def latest_expected_session(self, now: datetime | None = None) -> date:
         """The most recent trading session whose end-of-day data should
         already be available, given the current wall-clock time.

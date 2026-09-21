@@ -40,7 +40,7 @@ def test_seed_is_idempotent_and_reflects_current_settings(con, settings) -> None
     rows = con.execute(
         "SELECT count(*) FROM dataset_metadata WHERE dataset_name = ?", [PRICES_DAILY_DATASET]
     ).fetchone()[0]
-    assert rows == 7  # no duplicate rows from re-seeding
+    assert rows == 9  # no duplicate rows from re-seeding
 
 
 def test_set_metadata_upserts(con) -> None:

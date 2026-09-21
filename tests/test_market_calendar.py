@@ -48,9 +48,10 @@ def test_sessions_ago() -> None:
     assert CALENDAR.sessions_ago(date(2024, 1, 9), 1) == date(2024, 1, 8)
 
 
-def test_latest_expected_session_on_saturday_is_friday() -> None:
+def test_expected_latest_completed_session_aliases_latest_expected() -> None:
     now = datetime(2024, 1, 6, 10, 0, tzinfo=UTC)
-    assert CALENDAR.latest_expected_session(now) == date(2024, 1, 5)
+    assert CALENDAR.expected_latest_completed_session(now) == CALENDAR.latest_expected_session(now)
+    assert CALENDAR.expected_latest_completed_session(now) == date(2024, 1, 5)
 
 
 def test_latest_expected_session_korea_early_monday_is_still_friday() -> None:
@@ -70,6 +71,31 @@ def test_latest_expected_session_before_close_plus_grace_falls_back() -> None:
 def test_latest_expected_session_after_close_plus_grace() -> None:
     now = datetime(2024, 1, 2, 23, 30, tzinfo=UTC)  # 21:00 close + 120min grace = 23:00
     assert CALENDAR.latest_expected_session(now) == date(2024, 1, 2)
+
+
+def test_2026_09_18_is_trading_friday_not_saturday() -> None:
+    friday = date(2026, 9, 18)
+    saturday = date(2026, 9, 19)
+    assert friday.weekday() == 4  # Monday=0
+    assert saturday.weekday() == 5
+    assert CALENDAR.is_trading_day(friday) is True
+    assert CALENDAR.is_trading_day(saturday) is False
+    from app.utils.time_utils import english_weekday, format_session_date
+
+    assert english_weekday(friday) == "Friday"
+    assert english_weekday(saturday) == "Saturday"
+    assert format_session_date(friday) == "2026-09-18 (Friday)"
+    assert format_session_date(saturday) == "2026-09-19 (Saturday)"
+    assert format_session_date("2026-09-18") == "2026-09-18 (Friday)"
+
+
+def test_format_session_date_ignores_locale_strftime(monkeypatch) -> None:
+    import locale
+
+    from app.utils.time_utils import format_session_date
+
+    monkeypatch.setattr(locale, "setlocale", lambda *_a, **_k: "C")
+    assert format_session_date(date(2026, 9, 18)) == "2026-09-18 (Friday)"
 
 
 def test_grace_period_is_configurable() -> None:

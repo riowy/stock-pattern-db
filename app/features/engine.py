@@ -12,9 +12,10 @@ import polars as pl
 
 from app.features.adjustment import add_adjusted_prices
 from app.features.indicators import add_wilder_indicators
-from app.features.schema import FEATURE_COLUMNS, FEATURE_VALUE_COLUMNS, FEATURE_VERSION_V1
+from app.features.schema import FEATURE_COLUMNS, FEATURE_VALUE_COLUMNS, FEATURE_VERSION_V1, OHLC_DEPENDENT_FEATURE_COLUMNS
 from app.utils.numeric import sanitize_floats
 from app.utils.versioning import get_calculation_code_version
+from app.validation.numeric_tolerance import ohlc_valid_expr
 
 RETURN_WINDOWS = (1, 3, 5, 10, 20, 60)
 MA_WINDOWS = (5, 10, 20, 50, 120, 200)
@@ -180,6 +181,20 @@ class FeatureEngine:
             # Sector mapping is not trustworthy in v1 -- leave null, never guess.
             rel_exprs.append(pl.lit(None, dtype=pl.Float64).alias(f"rel_sector_{n}d"))
         work = work.with_columns(rel_exprs)
+
+        # Policy A: true-invalid OHLC rows keep the raw price bar but null
+        # OHLC-dependent derived features (ATR, gap, range, wick, high/low distance).
+        # Returns/RSI/volume that use close only are left as-is.
+        if all(c in work.columns for c in ("open", "high", "low", "close")):
+            work = work.with_columns(ohlc_valid_expr().alias("__ohlc_valid"))
+            null_exprs = [
+                pl.when(pl.col("__ohlc_valid")).then(pl.col(c)).otherwise(pl.lit(None, dtype=pl.Float64)).alias(c)
+                for c in OHLC_DEPENDENT_FEATURE_COLUMNS
+                if c in work.columns
+            ]
+            if null_exprs:
+                work = work.with_columns(null_exprs)
+            work = work.drop("__ohlc_valid")
 
         if vix_feat.height > 0:
             work = work.join(vix_feat, on="date", how="left")

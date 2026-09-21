@@ -15,7 +15,7 @@ from rich.console import Console
 from rich.table import Table
 
 from app.config.settings import Settings, get_settings
-from app.db.connection import duckdb_connection
+from app.db.connection import analytics_connection, duckdb_connection
 from app.db.migrations import run_migrations
 from app.db.schema import apply_schema
 from app.normalization.symbols import seed_symbol_mappings
@@ -24,6 +24,7 @@ from app.services.compact_service import compact_dataset
 from app.services.status_service import gather_status
 from app.services.storage_health_service import get_storage_health
 from app.utils.logging import get_logger, setup_logging
+from app.utils.time_utils import format_session_date
 
 app = typer.Typer(
     name="stockdb",
@@ -34,9 +35,17 @@ app = typer.Typer(
 validate_app = typer.Typer(help="Run data-quality validation against a dataset.")
 compact_app = typer.Typer(help="Compact small Parquet partition files into one file per partition.")
 universe_app = typer.Typer(help="Manage the tracked (operational) universe -- distinct from the full security master.")
+audit_app = typer.Typer(help="Audit data quality without mutating raw prices.")
+research_app = typer.Typer(help="Univariate feature research. Not recommendations or trading.")
+indicators_app = typer.Typer(help="On-demand technical indicators. Memory-only; never persisted.")
+mine_app = typer.Typer(help="Ephemeral pattern mining. Analysis discovers; validation only evaluates. Not trading.")
 app.add_typer(validate_app, name="validate")
 app.add_typer(compact_app, name="compact")
 app.add_typer(universe_app, name="universe")
+app.add_typer(audit_app, name="audit")
+app.add_typer(research_app, name="research")
+app.add_typer(indicators_app, name="indicators")
+app.add_typer(mine_app, name="mine")
 
 console = Console()
 logger = get_logger("cli")
@@ -128,6 +137,10 @@ def backfill_prices_cmd(
     all_active: bool = typer.Option(
         False, "--all-active", help="Target every active security (explicit full-universe backfill)."
     ),
+    universe: str | None = typer.Option(
+        None, "--universe", help="Named universe membership (e.g. research-common-equity-500)."
+    ),
+    workers: int | None = typer.Option(None, "--workers", help="Parallel fetch workers (default: MAX_WORKERS)."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview without fetching/writing."),
 ) -> None:
     """Backfill daily price history for one or many symbols, with checkpoint/resume.
@@ -143,27 +156,51 @@ def backfill_prices_cmd(
     if tracked and all_active:
         console.print("[red]Pass only one of --tracked or --all-active.[/red]")
         raise typer.Exit(1)
+    if universe and (tracked or all_active or symbols):
+        console.print("[red]--universe cannot be combined with --symbols/--tracked/--all-active.[/red]")
+        raise typer.Exit(1)
     if symbols:
         default_scope = "tracked"
+        symbol_list = _parse_symbols(symbols)
     elif tracked:
         default_scope = "tracked"
+        symbol_list = None
+    elif universe:
+        default_scope = "tracked"
+        symbol_list = None
     else:
         default_scope = "all_active"
+        symbol_list = None
 
     try:
         with duckdb_connection(settings) as con:
             _prepare_db(con, settings, dry_run=dry_run)
+            if universe:
+                from app.services.universe_membership_service import membership_security_ids
+
+                sids = membership_security_ids(con, universe)
+                if not sids:
+                    console.print(f"[red]Universe '{universe}' has no members. Create it with expand-universe first.[/red]")
+                    raise typer.Exit(1)
+                placeholders = ", ".join("?" for _ in sids)
+                rows = con.execute(
+                    f"SELECT primary_ticker FROM securities WHERE security_id IN ({placeholders}) "
+                    f"AND primary_ticker IS NOT NULL ORDER BY primary_ticker",
+                    sids,
+                ).fetchall()
+                symbol_list = [r[0] for r in rows]
             try:
                 result = run_price_ingestion(
                     settings,
                     con,
-                    symbols=_parse_symbols(symbols),
+                    symbols=symbol_list,
                     start=_parse_date(start),
                     end=_parse_date(end),
                     batch_size=batch_size or settings.price_batch_size,
                     resume=resume,
                     dry_run=dry_run,
                     default_scope=default_scope,
+                    workers=workers,
                 )
             except ProviderNotAllowedError as exc:
                 console.print(f"[bold red]{exc}[/bold red]")
@@ -198,27 +235,83 @@ def backfill_prices_cmd(
 @app.command("sync-prices")
 def sync_prices_cmd(
     symbols: str | None = typer.Option(None, "--symbols", help="Comma-separated canonical tickers. Omit for the tracked price universe."),
-    lookback_days: int = typer.Option(10, "--lookback-days", help="Trailing window to re-fetch."),
+    lookback_days: int = typer.Option(
+        10,
+        "--lookback-days",
+        help="Deprecated. Daily overlap uses DAILY_PRICE_LOOKBACK_SESSIONS (XNYS sessions).",
+    ),
     dry_run: bool = typer.Option(False, "--dry-run"),
 ) -> None:
-    """Incrementally refresh recent daily prices for the tracked price universe."""
+    """Incrementally refresh recent daily prices for the tracked price universe.
+
+    Already-current names are not requested. Only STALE and NO_DATA targets
+    hit the price provider. Overlap is DAILY_PRICE_LOOKBACK_SESSIONS.
+    """
     settings = _bootstrap()
-    from app.ingestion.price_sync import sync_recent_prices
+    from app.ingestion.price_sync import format_price_fast_path, sync_recent_prices
 
     with duckdb_connection(settings) as con:
         _prepare_db(con, settings, dry_run=dry_run)
         result = sync_recent_prices(settings, con, _parse_symbols(symbols), lookback_days, dry_run)
 
-    if result.dry_run or result.total_symbols == 0:
+    console.print(f"Price fast path: {format_price_fast_path(result)}")
+    if result.tracked_targets == 0:
+        console.print("[yellow]No tracked price securities -- nothing to sync. Use 'stockdb universe add'.[/yellow]")
+        return
+    if result.provider_fetch_skipped:
+        console.print(f"[bold green]{result.message}[/bold green]")
+        console.print(f"provider call count = {result.provider_fetch_count}")
+        return
+    if result.dry_run:
         console.print(
-            f"[bold]\\[dry-run][/bold] would refresh {result.total_symbols} tracked symbol(s)."
-            if result.dry_run
-            else "[yellow]No tracked price securities -- nothing to sync. Use 'stockdb universe add'.[/yellow]"
+            f"[bold]\\[dry-run][/bold] would fetch {result.fetch_targets} of "
+            f"{result.tracked_targets} tracked symbol(s). No network requests."
         )
         return
     console.print(
-        f"[bold green]Price sync complete[/bold green]: {result.successful}/{result.total_symbols} succeeded, "
-        f"{result.failed} failed, {result.rows_written} rows written."
+        f"[bold green]Price sync complete[/bold green]: {result.successful}/{result.fetch_targets} succeeded, "
+        f"{result.failed} failed, {result.rows_written} rows written, "
+        f"provider_fetch_count={result.provider_fetch_count}."
+    )
+
+
+@app.command("repair-prices")
+def repair_prices_cmd(
+    lookback_sessions: int | None = typer.Option(
+        None,
+        "--lookback-sessions",
+        help="XNYS sessions to re-fetch ending at the expected latest completed session "
+        "(default: PRICE_REPAIR_LOOKBACK_SESSIONS).",
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Plan the repair window without network or writes."),
+) -> None:
+    """Re-fetch recent sessions for every tracked price target (weekly repair).
+
+    Ignores CURRENT/STALE classification. Does not expand to the full security master.
+    """
+    settings = _bootstrap()
+    from app.ingestion.price_repair import repair_prices
+
+    with duckdb_connection(settings) as con:
+        _prepare_db(con, settings, dry_run=dry_run)
+        result = repair_prices(settings, con, lookback_sessions=lookback_sessions, dry_run=dry_run)
+
+    console.print("[bold]Weekly price repair plan[/bold]" if result.dry_run else "[bold]Weekly price repair[/bold]")
+    console.print(f"Tracked targets: {result.tracked_targets}")
+    console.print(f"Lookback sessions: {result.lookback_sessions}")
+    console.print(f"Start session: {result.start_session.isoformat()}")
+    console.print(f"End session: {result.end_session.isoformat()}")
+    console.print(f"Batch size: {result.batch_size}")
+    console.print(f"Workers: {result.workers}")
+    if result.dry_run:
+        console.print(f"Network requests planned: {result.network_requests_planned}")
+        console.print("No writes performed.")
+        return
+    console.print(
+        f"[bold green]Price repair complete[/bold green]: "
+        f"{result.backfill.successful}/{result.tracked_targets} succeeded, "
+        f"{result.backfill.failed} failed, {result.rows_written} rows written, "
+        f"provider_fetch_count={result.provider_fetch_count}."
     )
 
 
@@ -386,25 +479,31 @@ def compute_labels_cmd(
 
 @app.command("expand-universe")
 def expand_universe_cmd(
-    research_scale: int | None = typer.Option(None, "--research-scale", help="Deterministic scale-test size, e.g. 100 or 500."),
+    research_scale: int | None = typer.Option(None, "--research-scale", help="Provider scale-test size, e.g. 100."),
+    research_common_equity: int | None = typer.Option(
+        None, "--research-common-equity", help="Research common-equity size, e.g. 100 or 500."
+    ),
     all_active: bool = typer.Option(False, "--all-active", help="Register every active security as tracked."),
     dry_run: bool = typer.Option(False, "--dry-run"),
 ) -> None:
-    """Grow the tracked/research-scale universe. Never starts a full-history backfill."""
+    """Grow tracked/research universes. Never starts a full-history backfill."""
     settings = _bootstrap()
     from app.ingestion.research_universe import (
         all_active_tickers,
+        apply_research_common_equity_universe,
         apply_research_scale_universe,
+        build_research_common_equity_universe,
         build_research_scale_universe,
         estimate_price_backfill,
     )
     from app.services.tracked_universe_service import add_tracked
 
-    if research_scale and all_active:
-        console.print("[red]Pass only one of --research-scale or --all-active.[/red]")
+    chosen = [x for x in (research_scale, research_common_equity, all_active) if x]
+    if len(chosen) > 1:
+        console.print("[red]Pass only one of --research-scale, --research-common-equity, or --all-active.[/red]")
         raise typer.Exit(1)
-    if not research_scale and not all_active:
-        console.print("[red]Pass --research-scale N or --all-active.[/red]")
+    if not chosen:
+        console.print("[red]Pass --research-scale N, --research-common-equity N, or --all-active.[/red]")
         raise typer.Exit(1)
 
     with duckdb_connection(settings) as con:
@@ -415,7 +514,18 @@ def expand_universe_cmd(
             label = "[dry-run] would register" if dry_run else "Registered"
             console.print(
                 f"[bold green]{label}[/bold green] {plan.name}: {plan.size} securities "
-                f"(scale-test universe, not an investment universe)."
+                f"(PROVIDER_SCALE_TEST, not an investment universe)."
+            )
+            console.print(f"  Criteria: {plan.criteria}")
+            console.print(f"  Sample: {', '.join(plan.tickers[:15])}{'...' if plan.size > 15 else ''}")
+            return
+        if research_common_equity:
+            plan = build_research_common_equity_universe(con, research_common_equity)
+            apply_research_common_equity_universe(con, plan, dry_run=dry_run)
+            label = "[dry-run] would register" if dry_run else "Registered"
+            console.print(
+                f"[bold green]{label}[/bold green] {plan.name}: {plan.size} securities "
+                f"(RESEARCH_COMMON_EQUITY; benchmarks kept separate)."
             )
             console.print(f"  Criteria: {plan.criteria}")
             console.print(f"  Sample: {', '.join(plan.tickers[:15])}{'...' if plan.size > 15 else ''}")
@@ -515,13 +625,286 @@ def validate_labels_cmd(
     )
 
 
+@audit_app.command("prices")
+def audit_prices_cmd() -> None:
+    """OHLC quality split: research common equity vs non-common instruments."""
+    settings = _bootstrap()
+    from app.services.price_audit_service import audit_prices
+
+    with duckdb_connection(settings) as con:
+        _prepare_db(con, settings)
+        report = audit_prices(settings, con)
+    console.print("[bold]Price quality audit[/bold]")
+    console.print(f"  Rows checked: {report.rows_checked}")
+    console.print("  Research common equities")
+    console.print(f"    critical: {report.research_critical}")
+    console.print(f"    warning: {report.research_warning}")
+    if report.research_true_critical_tickers:
+        console.print(f"    unexplained tickers: {', '.join(report.research_true_critical_tickers)}")
+    console.print("  Non-common instruments")
+    console.print(f"    critical: {report.non_common_critical}")
+    console.print(f"    warning: {report.non_common_warning}")
+    console.print(f"  Rounding-only: {report.rounding_only}")
+    console.print(f"  True OHLC violation: {report.true_ohlc_violations}")
+    console.print(f"  All-provider critical: {report.all_provider_critical}")
+
+
+@audit_app.command("extreme-labels")
+def audit_extreme_labels_cmd() -> None:
+    """Classify EXTREME_LABEL warnings; does not raise the |x|>2 threshold."""
+    settings = _bootstrap()
+    from app.services.extreme_label_audit_service import audit_extreme_labels
+
+    with duckdb_connection(settings) as con:
+        _prepare_db(con, settings)
+        report = audit_extreme_labels(settings, con)
+    console.print(f"[bold]Extreme-label audit[/bold] total={report.total}")
+    console.print(f"  Causes: {report.by_cause}")
+    console.print(f"  Instrument class: {report.by_instrument_class}")
+    console.print(f"  Horizon: {report.by_horizon}")
+    console.print(f"  Near corporate action: {report.near_corporate_action}")
+    console.print(f"  adj_close jump: {report.adj_close_jump}")
+    console.print(f"  RESEARCH_COMMON_EQUITY unexplained (C/D/E): {report.research_unexplained}")
+    table = Table(title="Top tickers")
+    table.add_column("Ticker")
+    table.add_column("Count", justify="right")
+    for ticker, n in report.by_ticker[:20]:
+        table.add_row(str(ticker), str(n))
+    console.print(table)
+    pos = Table(title="Largest positive 30")
+    pos.add_column("Ticker")
+    pos.add_column("Date")
+    pos.add_column("Horizon")
+    pos.add_column("Value")
+    pos.add_column("Cause")
+    for row in report.largest_positive:
+        pos.add_row(str(row["ticker"]), str(row["date"]), str(row["horizon"]), f"{row['value']:.4f}", row["cause"])
+    console.print(pos)
+    neg = Table(title="Largest negative 30")
+    neg.add_column("Ticker")
+    neg.add_column("Date")
+    neg.add_column("Horizon")
+    neg.add_column("Value")
+    neg.add_column("Cause")
+    for row in report.largest_negative:
+        neg.add_row(str(row["ticker"]), str(row["date"]), str(row["horizon"]), f"{row['value']:.4f}", row["cause"])
+    console.print(neg)
+
+
+@research_app.command("reconcile")
+def research_reconcile_cmd() -> None:
+    """Explain prices/features/labels vs tracked/universe security counts."""
+    settings = _bootstrap()
+    from app.research.dataset import (
+        daily_collection_scope,
+        label_maturity_dates,
+        reconcile_datasets,
+        reconcile_price_feature_rows,
+    )
+
+    with duckdb_connection(settings) as con:
+        _prepare_db(con, settings)
+        report = reconcile_datasets(settings, con)
+        scope = daily_collection_scope(con)
+        pf = reconcile_price_feature_rows(settings, con)
+        maturity = label_maturity_dates(settings, con)
+    console.print("[bold]Dataset reconciliation[/bold]")
+    console.print(f"  prices {report.price_rows} rows / {report.price_securities} securities")
+    console.print(f"  features {report.feature_rows} rows / {report.feature_securities} securities")
+    console.print(f"  labels {report.label_rows} rows / {report.label_securities} securities")
+    console.print(
+        f"  ALL_THREE={report.all_three} PRICE_ONLY={report.price_only} "
+        f"FEATURE_ONLY={report.feature_only} LABEL_ONLY={report.label_only} "
+        f"row_mismatches={report.row_count_mismatches}"
+    )
+    console.print(
+        f"  PRICE_WITH_FEATURE={pf.price_with_feature} "
+        f"PRICE_NO_FEATURE_EXPECTED={pf.price_no_feature_expected} "
+        f"PRICE_NO_FEATURE_UNEXPECTED={pf.price_no_feature_unexpected}"
+    )
+    console.print(f"  {pf.note}")
+    console.print(
+        f"  Research common equities: {scope.get('research_common_equity_500', 0)}"
+    )
+    console.print(f"  Provider scale-test extras: {scope.get('provider_scale_test_extras', 0)}")
+    console.print(f"  Benchmarks: {scope.get('benchmarks', 0)}")
+    console.print(f"  Total tracked price targets: {scope.get('total_tracked_price_targets', 0)}")
+    console.print(
+        f"  Known securities (not daily target): {scope.get('known_securities', 0)}"
+    )
+    console.print(
+        f"  labels maturity: row={maturity.get('latest_label_row_date')} "
+        f"1d={maturity.get('latest_mature_1d')} 5d={maturity.get('latest_mature_5d')} "
+        f"10d={maturity.get('latest_mature_10d')} 20d={maturity.get('latest_mature_20d')}"
+    )
+    console.print(f"  cause: {report.cause}")
+    if pf.unexpected_examples:
+        console.print("  unexpected missing feature examples: " + str(pf.unexpected_examples[:10]))
+    if report.tracked_without_price_tickers:
+        console.print("  tracked without prices: " + ", ".join(report.tracked_without_price_tickers))
+
+
+@research_app.command("baseline")
+def research_baseline_cmd(
+    split: str = typer.Option("development", "--split"),
+) -> None:
+    """Unconditional forward-return baseline. Not a strategy."""
+    settings = _bootstrap()
+    from app.research.dataset import load_research_frame
+    from app.research.statistics import baseline_table
+
+    with duckdb_connection(settings) as con:
+        _prepare_db(con, settings)
+        frame = load_research_frame(settings, con)
+        table = baseline_table(frame, split)
+    _print_df("Baseline", table)
+
+
+@research_app.command("feature-coverage")
+def research_feature_coverage_cmd(
+    split: str = typer.Option("development", "--split"),
+) -> None:
+    settings = _bootstrap()
+    from app.research.dataset import load_research_frame
+    from app.research.statistics import coverage_table
+
+    with duckdb_connection(settings) as con:
+        _prepare_db(con, settings)
+        frame = load_research_frame(settings, con)
+        table = coverage_table(frame, split)
+    _print_df("Feature coverage", table.select(
+        ["feature", "non_null", "null_ratio", "high_null", "mean", "median", "p5", "p95"]
+        if table.height and "mean" in table.columns
+        else table.columns
+    ))
+
+
+@research_app.command("quantiles")
+def research_quantiles_cmd(
+    feature: str = typer.Option(..., "--feature"),
+    split: str = typer.Option("development", "--split"),
+) -> None:
+    """Cross-sectional quintiles. Research statistic, not a recommendation."""
+    settings = _bootstrap()
+    from app.research.dataset import load_research_frame
+    from app.research.statistics import quantile_table, spread_table
+
+    with duckdb_connection(settings) as con:
+        _prepare_db(con, settings)
+        frame = load_research_frame(settings, con)
+        q = quantile_table(frame, [feature], split)
+        s = spread_table(q)
+    _print_df(f"Quantiles {feature} {split}", q)
+    _print_df("Q5-Q1", s)
+
+
+@research_app.command("ic")
+def research_ic_cmd(
+    feature: str | None = typer.Option(None, "--feature"),
+    split: str = typer.Option("development", "--split"),
+) -> None:
+    settings = _bootstrap()
+    from app.research.config import SMOKE_FEATURES
+    from app.research.dataset import load_research_frame
+    from app.research.statistics import ic_table
+
+    feats = [feature] if feature else list(SMOKE_FEATURES)
+    with duckdb_connection(settings) as con:
+        _prepare_db(con, settings)
+        frame = load_research_frame(settings, con)
+        table = ic_table(frame, feats, split)
+    _print_df("Rank IC", table)
+
+
+@research_app.command("regimes")
+def research_regimes_cmd(
+    feature: str = typer.Option(..., "--feature"),
+    split: str = typer.Option("development", "--split"),
+) -> None:
+    settings = _bootstrap()
+    from app.research.dataset import filter_split, load_research_frame
+    from app.research.statistics import attach_regimes, freeze_vix_cutoffs, quantile_table
+    from app.research.config import SPLIT_DEVELOPMENT
+
+    with duckdb_connection(settings) as con:
+        _prepare_db(con, settings)
+        frame = load_research_frame(settings, con)
+        vix_q33, vix_q67 = freeze_vix_cutoffs(filter_split(frame, SPLIT_DEVELOPMENT))
+        frame = attach_regimes(frame, vix_q33, vix_q67)
+        spy = quantile_table(frame, [feature], split, regime_kind="spy_trend", regime_col="spy_trend_regime")
+        vix = quantile_table(frame, [feature], split, regime_kind="vix", regime_col="vix_regime")
+    console.print(f"VIX cutoffs frozen from development: q33={vix_q33} q67={vix_q67}")
+    _print_df("SPY trend regimes", spy)
+    _print_df("VIX regimes", vix)
+
+
+@research_app.command("report")
+def research_report_cmd(
+    version: str = typer.Option("v1", "--version"),
+    features: str | None = typer.Option(None, "--features", help="Comma-separated. Default: smoke 6."),
+) -> None:
+    """Write data/research/{version}/*.parquet. Does not retune from validation."""
+    settings = _bootstrap()
+    from app.research.report import run_research_report
+
+    feat_list = [s.strip() for s in features.split(",")] if features else None
+    with duckdb_connection(settings) as con:
+        _prepare_db(con, settings)
+        result = run_research_report(settings, con, features=feat_list, version=version)
+    console.print("[bold]Research report[/bold] (statistics only; not recommendations)")
+    console.print(f"  sample securities={result.securities} rows={result.rows}")
+    console.print(f"  development_rows={result.development_rows} validation_rows={result.validation_rows}")
+    console.print(f"  vix_cutoffs (dev freeze) q33={result.vix_q33} q67={result.vix_q67}")
+    console.print(f"  output={result.output_dir}")
+    console.print(f"  runtime_sec={result.runtime_sec:.1f} rss_mb={result.rss_mb} peak_rss_mb={result.peak_rss_mb}")
+    for path in result.files:
+        console.print(f"  wrote {path}")
+    summary_path = Path(result.output_dir) / "feature_research_summary.parquet"
+    if summary_path.exists():
+        import polars as pl
+
+        _print_df(
+            "Feature research summary (factual statistics; not a ranking or recommendation)",
+            pl.read_parquet(summary_path),
+        )
+
+
+def _print_df(title: str, df) -> None:  # noqa: ANN001
+    console.print(f"[bold]{title}[/bold] rows={0 if df is None else df.height}")
+    if df is None or df.height == 0:
+        return
+    table = Table(title=title)
+    cols = list(df.columns)[:14]
+    for col in cols:
+        table.add_column(str(col))
+    for rec in df.head(40).iter_rows(named=True):
+        table.add_row(*[_fmt_cell(rec.get(c)) for c in cols])
+    console.print(table)
+
+
+def _fmt_cell(value: object) -> str:
+    if value is None:
+        return "-"
+    if isinstance(value, float):
+        return f"{value:.4f}"
+    return str(value)
+
+
 @compact_app.command("prices")
 def compact_prices_cmd(
     year: int | None = typer.Option(None, "--year"),
     month: int | None = typer.Option(None, "--month"),
     dry_run: bool = typer.Option(False, "--dry-run"),
+    verify: bool = typer.Option(
+        True,
+        "--verify/--no-verify",
+        help="Compare logical rows/securities/dates/duplicates before and after compaction.",
+    ),
 ) -> None:
-    """Merge small partition files in data/lake/prices_daily into one file per partition."""
+    """Merge small partition files in data/lake/prices_daily. Omit year/month to compact all months."""
+    if verify:
+        _compact_verified("prices", year, month, dry_run)
+        return
     _compact_generic("prices", year, month, dry_run)
 
 
@@ -546,7 +929,15 @@ def compact_volatility_cmd(
 def compact_corporate_actions_cmd(
     year: int | None = typer.Option(None, "--year", help="Yearly-partitioned dataset -- no --month."),
     dry_run: bool = typer.Option(False, "--dry-run"),
+    verify: bool = typer.Option(
+        True,
+        "--verify/--no-verify",
+        help="Compare logical rows/securities/dates/duplicates before and after compaction.",
+    ),
 ) -> None:
+    if verify:
+        _compact_verified("corporate_actions", year, None, dry_run)
+        return
     _compact_generic("corporate_actions", year, None, dry_run)
 
 
@@ -583,6 +974,33 @@ def _compact_generic(name: str, year: int | None, month: int | None, dry_run: bo
     if not results:
         console.print("[yellow]Nothing to compact.[/yellow]")
         return
+    _print_compact_table(name, results)
+
+
+def _compact_verified(name: str, year: int | None, month: int | None, dry_run: bool) -> None:
+    from app.services.compact_service import CompactVerificationError, compact_dataset_verified
+
+    settings = _bootstrap()
+    with duckdb_connection(settings) as con:
+        _prepare_db(con, settings, dry_run=False)
+        try:
+            verified = compact_dataset_verified(settings, name, year, month, dry_run=dry_run, con=con)
+        except CompactVerificationError as exc:
+            console.print(f"[bold red]Compaction verification FAILED:[/bold red] {exc}")
+            raise typer.Exit(1) from exc
+    b, a = verified.before, verified.after
+    console.print(
+        f"[bold]Logical snapshot[/bold] rows {b.rows}->{a.rows}, securities {b.securities}->{a.securities}, "
+        f"dates {b.min_date}..{b.max_date} -> {a.min_date}..{a.max_date}, "
+        f"dups {b.duplicates}->{a.duplicates}, files {b.files}->{a.files}"
+    )
+    if not verified.partitions:
+        console.print("[yellow]Nothing to compact (logical snapshot unchanged).[/yellow]")
+        return
+    _print_compact_table(name, verified.partitions)
+
+
+def _print_compact_table(name: str, results) -> None:  # noqa: ANN001
     table = Table(title=f"Compaction results: {name}")
     table.add_column("Partition")
     table.add_column("Files before", justify="right")
@@ -855,7 +1273,11 @@ def status() -> None:
     universe_table.add_column("Value", justify="right")
     universe_table.add_row("Total known securities", str(report.universe.total_known_securities))
     universe_table.add_row("Active securities", str(report.universe.active_securities))
-    universe_table.add_row("Tracked securities", str(report.universe.tracked_securities))
+    universe_table.add_row("Research common equities", str(report.universe.research_common_equities))
+    universe_table.add_row("Provider scale-test extras", str(report.universe.provider_scale_test_extras))
+    universe_table.add_row("Benchmarks", str(report.universe.benchmarks))
+    universe_table.add_row("Total tracked price targets", str(report.universe.total_tracked_price_targets))
+    universe_table.add_row("Tracked securities (enabled)", str(report.universe.tracked_securities))
     universe_table.add_row("Tracked for prices", str(report.universe.tracked_for_prices))
     console.print(universe_table)
 
@@ -863,8 +1285,9 @@ def status() -> None:
     prices_table.add_column("Metric")
     prices_table.add_column("Value", justify="right")
     prices_table.add_row("Row count (estimate)", str(report.prices.total_rows_estimate))
-    prices_table.add_row("Earliest date", report.prices.earliest_date or "-")
-    prices_table.add_row("Latest date", report.prices.latest_date or "-")
+    prices_table.add_row("Lake distinct securities", str(report.prices.lake_distinct_securities))
+    prices_table.add_row("Earliest date", format_session_date(report.prices.earliest_date))
+    prices_table.add_row("Latest date", format_session_date(report.prices.latest_date))
     prices_table.add_row("Tracked securities current", str(report.prices.tracked_current))
     prices_table.add_row("Tracked securities stale", str(report.prices.tracked_stale))
     prices_table.add_row("Tracked securities with no data", str(report.prices.tracked_no_data))
@@ -874,18 +1297,24 @@ def status() -> None:
     feat_table.add_column("Metric")
     feat_table.add_column("Value", justify="right")
     feat_table.add_row("Rows", str(report.features.rows))
-    feat_table.add_row("Latest feature date", report.features.latest_date or "-")
+    feat_table.add_row("Lake distinct securities", str(report.features.lake_distinct_securities))
+    feat_table.add_row("Latest feature date", format_session_date(report.features.latest_date))
     feat_table.add_row("Tracked current", str(report.features.tracked_current))
     feat_table.add_row("Tracked stale", str(report.features.tracked_stale))
+    feat_table.add_row("Tracked with no data", str(report.features.tracked_no_data))
     console.print(feat_table)
 
     lab_table = Table(title="Labels")
     lab_table.add_column("Metric")
     lab_table.add_column("Value", justify="right")
     lab_table.add_row("Rows", str(report.labels.rows))
-    lab_table.add_row("Latest date", report.labels.latest_date or "-")
-    lab_table.add_row("Latest mature 20d horizon", report.labels.latest_mature_horizon or "-")
-    lab_table.add_row("Recent null expected", "yes" if report.labels.recent_null_expected else "no")
+    lab_table.add_row("Lake distinct securities", str(report.labels.lake_distinct_securities))
+    lab_table.add_row("Latest date", format_session_date(report.labels.latest_date))
+    lab_table.add_row("Latest mature 1d date", format_session_date(report.labels.latest_mature_1d))
+    lab_table.add_row("Latest mature 5d date", format_session_date(report.labels.latest_mature_5d))
+    lab_table.add_row("Latest mature 10d date", format_session_date(report.labels.latest_mature_10d))
+    lab_table.add_row("Latest mature 20d date", format_session_date(report.labels.latest_mature_20d))
+    lab_table.add_row("Recent null expected (immature, not missing)", "yes" if report.labels.recent_null_expected else "no")
     console.print(lab_table)
 
     daily_table = Table(title="Daily")
@@ -899,7 +1328,7 @@ def status() -> None:
     macro_table = Table(title="Macro (FRED)")
     macro_table.add_column("Metric")
     macro_table.add_column("Value", justify="right")
-    macro_table.add_row("FRED_API_KEY configured", "yes" if report.macro.fred_configured else "no")
+    macro_table.add_row("FRED_API_KEY configured", "YES" if report.macro.fred_configured else "NO")
     macro_table.add_row("Series tracked", str(report.macro.series_count))
     macro_table.add_row("Last update", report.macro.last_update or "-")
     console.print(macro_table)
@@ -908,12 +1337,13 @@ def status() -> None:
     vix_table.add_column("Metric")
     vix_table.add_column("Value", justify="right")
     vix_table.add_row("Rows", str(report.vix.rows))
-    vix_table.add_row("Latest date", report.vix.latest_date or "-")
+    vix_table.add_row("Latest date", format_session_date(report.vix.latest_date))
     console.print(vix_table)
 
     sec_table = Table(title="SEC Filings")
     sec_table.add_column("Metric")
     sec_table.add_column("Value", justify="right")
+    sec_table.add_row("SEC_USER_AGENT configured", "YES" if report.sec.user_agent_configured else "NO")
     sec_table.add_row("Tracked CIKs", str(report.sec.tracked_ciks))
     sec_table.add_row("Filings tracked", str(report.sec.filings_tracked))
     sec_table.add_row("Last retrieved at", report.sec.last_filing_retrieved_at or "-")
@@ -967,6 +1397,43 @@ def status() -> None:
     console.print(ri_table)
 
 
+@app.command()
+def doctor() -> None:
+    """Operational environment check before scheduler registration. Does not print secrets."""
+    settings = _bootstrap()
+    from app.services.doctor_service import run_doctor
+
+    with duckdb_connection(settings) as con:
+        _prepare_db(con, settings)
+        report = run_doctor(settings, con)
+
+    table = Table(title="stockdb doctor")
+    table.add_column("Check")
+    table.add_column("Status")
+    table.add_column("Detail")
+    for check in report.checks:
+        color = {"OK": "green", "WARN": "yellow", "FAIL": "red"}.get(check.status, "white")
+        table.add_row(check.name, f"[{color}]{check.status}[/{color}]", check.detail)
+    console.print(table)
+    console.print(
+        f"OK={report.ok_count} WARN={report.warn_count} FAIL={report.fail_count} | "
+        f"doctor_gate={('PASS' if report.fail_count == 0 else 'FAIL')} | "
+        f"scheduler_ready_from_doctor={str(report.scheduler_ready_from_doctor).lower()}"
+    )
+    console.print(
+        "[dim]Full scheduler_ready also requires a successful dry-run, a real run-daily, "
+        "and a same-session second run that is logically idempotent. This command does not "
+        "register Task Scheduler.[/dim]"
+    )
+    secret_needles = [settings.sec_user_agent, settings.fred_api_key]
+    rendered = str(table) + "".join(check.detail for check in report.checks)
+    for needle in secret_needles:
+        if needle and needle.strip() and needle.strip() in rendered:
+            raise typer.Exit(code=2)
+    if report.fail_count:
+        raise typer.Exit(code=1)
+
+
 def _human_bytes(n: int) -> str:
     value = float(n)
     for unit in ("B", "KB", "MB", "GB", "TB"):
@@ -974,6 +1441,258 @@ def _human_bytes(n: int) -> str:
             return f"{value:.1f}{unit}"
         value /= 1024
     return f"{value:.1f}TB"
+
+
+@indicators_app.command("list")
+def indicators_list_cmd(group: str | None = typer.Option(None, "--group", help="Filter by category.")) -> None:
+    """List registered indicators. Does not compute or write anything."""
+    from app.indicators.cli import print_list
+
+    print_list(console, category=group)
+
+
+@indicators_app.command("show")
+def indicators_show_cmd(
+    symbol: str = typer.Option(..., "--symbol", help="Canonical ticker, e.g. AAPL."),
+    start: str = typer.Option("2025-01-01", "--start"),
+    end: str | None = typer.Option(None, "--end"),
+    group: str | None = typer.Option(None, "--group"),
+    indicator: str | None = typer.Option(None, "--indicator"),
+    show_all: bool = typer.Option(False, "--all"),
+    tail: int = typer.Option(30, "--tail"),
+) -> None:
+    """Compute indicators in memory and print a terminal table. No files are written."""
+    settings = _bootstrap()
+    from app.indicators.cli import load_symbol_prices, print_show
+    from app.indicators.engine import IndicatorEngine
+    from app.indicators.persist import assert_no_indicator_persist
+    from app.services.market_calendar import MarketCalendarService
+
+    assert_no_indicator_persist()
+    start_d = _parse_date(start)
+    end_d = _parse_date(end) if end else MarketCalendarService(settings.market_calendar).expected_latest_completed_session()
+    if start_d is None:
+        raise typer.Exit(1)
+    with analytics_connection(settings) as con:
+        prices = load_symbol_prices(settings, con, symbol, start_d, end_d)
+    groups = [group] if group else None
+    ids = [indicator] if indicator else None
+    df = IndicatorEngine().compute(prices, groups=groups, indicator_ids=ids, start=start_d, end=end_d, include_geometry=not show_all)
+    print_show(console, df, group=group, indicator=indicator, show_all=show_all, tail=tail)
+
+
+@mine_app.command("run")
+def mine_run_cmd(
+    target: str = typer.Option("forward_excess_spy_20d", "--target"),
+    analysis_start: str = typer.Option("2018-01-02", "--analysis-start"),
+    analysis_end: str = typer.Option("2023-12-29", "--analysis-end"),
+    validation_start: str = typer.Option("2024-01-02", "--validation-start"),
+    validation_end: str | None = typer.Option(None, "--validation-end"),
+    test_start: str | None = typer.Option(None, "--test-start", help="Deprecated alias for --validation-start."),
+    test_end: str | None = typer.Option(None, "--test-end", help="Deprecated alias for --validation-end."),
+    max_rule_size: int = typer.Option(2, "--max-rule-size"),
+    top: int = typer.Option(30, "--top"),
+    min_rows: int = typer.Option(1000, "--min-rows"),
+    min_dates: int = typer.Option(100, "--min-dates"),
+    min_securities: int = typer.Option(30, "--min-securities"),
+    fdr_q: float = typer.Option(0.10, "--fdr-q"),
+    event_mode: str = typer.Option("state", "--event-mode", help="state or entry"),
+    cooldown_sessions: int = typer.Option(0, "--cooldown-sessions"),
+) -> None:
+    """Discover on ANALYSIS; evaluate the frozen set on VALIDATION. No files written."""
+    settings = _bootstrap()
+    import polars as pl
+
+    from app.mining.cli import print_audit_table, print_mining_table
+    from app.mining.config import FUTURE_HOLDOUT_EVALUATION_ENABLED, FUTURE_HOLDOUT_START, PATTERN_FREEZE_POLICY
+    from app.mining.data import load_mining_frame
+    from app.mining.engine import MiningEngine, price_floor_audit, regime_audit
+    from app.mining.persist import assert_no_mining_persist
+
+    assert_no_mining_persist()
+    a0, a1 = _parse_date(analysis_start), _parse_date(analysis_end)
+    v0 = _parse_date(test_start or validation_start)
+    v1 = _parse_date(test_end or validation_end) if (test_end or validation_end) else None
+    if a0 is None or a1 is None or v0 is None:
+        raise typer.Exit(1)
+    if event_mode not in {"state", "entry"}:
+        console.print("[red]--event-mode must be state or entry[/red]")
+        raise typer.Exit(1)
+    if a0 > a1 or (v1 is not None and v0 > v1) or a1 >= v0:
+        console.print("[red]analysis and validation ranges must be disjoint, with validation after analysis.[/red]")
+        raise typer.Exit(1)
+    with analytics_connection(settings) as con:
+        console.print("[dim]Loading research-common-equity frame and on-demand indicators (memory only)...[/dim]")
+        frame, mature = load_mining_frame(settings, con, analysis_start=a0, validation_end=v1, target=target)
+    if frame.height == 0:
+        console.print("[yellow]No research-common-equity rows available.[/yellow]")
+        raise typer.Exit(1)
+    holdout_end = v1 or mature
+    engine = MiningEngine()
+    uncond = frame.filter((pl.col("date") >= a0) & (pl.col("date") <= a1) & pl.col(target).is_not_null())
+    if uncond.height:
+        console.print(
+            f"[dim]ANALYSIS unconditional {target}: n={uncond.height} "
+            f"median={float(uncond[target].median()):.4f} mean={float(uncond[target].mean()):.4f}[/dim]"
+        )
+    console.print(f"[dim]Discovering on ANALYSIS {a0}..{a1} mode={event_mode} cooldown={cooldown_sessions}...[/dim]")
+    discovered, specs, frozen, cutoffs = engine.discover(
+        frame,
+        target=target,
+        analysis_start=a0,
+        analysis_end=a1,
+        min_rows=min_rows,
+        min_dates=min_dates,
+        min_securities=min_securities,
+        max_rule_size=max_rule_size,
+        fdr_q=fdr_q,
+        event_mode=event_mode,
+        cooldown_sessions=cooldown_sessions,
+    )
+    selected = [r for r in discovered if r.selected]
+    console.print(f"[dim]Evaluating {len(selected)} FDR-selected patterns on VALIDATION {v0}..{holdout_end}...[/dim]")
+    evaluated = engine.evaluate_validation(
+        frame,
+        discovered,
+        specs,
+        cutoffs,
+        target=target,
+        validation_start=v0,
+        validation_end=holdout_end,
+        event_mode=event_mode,
+        cooldown_sessions=cooldown_sessions,
+    )
+    evaluated.sort(
+        key=lambda r: (
+            r.fdr_q is None,
+            r.fdr_q if r.fdr_q is not None else 1.0,
+            -abs(r.analysis.get("vs_baseline_nw_t") or 0.0),
+            -(r.analysis.get("kept") or r.analysis.get("n") or 0),
+        )
+    )
+    console.print(
+        f"Mining v1 | target={target} | analysis={a0}..{a1} | validation={v0}..{holdout_end} | "
+        f"mode={event_mode} cooldown={cooldown_sessions} | rows={frame.height} | "
+        f"singles+pairs={len(discovered)} | selected q<={fdr_q}: {len(selected)}"
+    )
+    console.print(f"[dim]FUTURE_HOLDOUT starts {FUTURE_HOLDOUT_START}; evaluation_enabled={FUTURE_HOLDOUT_EVALUATION_ENABLED}[/dim]")
+    console.print(f"[dim]{PATTERN_FREEZE_POLICY}[/dim]")
+    if frozen:
+        console.print(f"Analysis-frozen quantiles: {list(frozen.keys())}")
+    print_mining_table(console, evaluated or selected, title="VALIDATION-evaluated analysis candidates", top=top)
+    if evaluated:
+        for row in evaluated[: min(3, len(evaluated))]:
+            floors = price_floor_audit(frame, row.pattern, specs, target, cutoffs=cutoffs, event_mode=event_mode, cooldown_sessions=cooldown_sessions)
+            print_audit_table(console, floors, title=f"Price-floor audit | {row.pattern}")
+            regimes = regime_audit(
+                frame,
+                row.pattern,
+                specs,
+                target,
+                analysis_start=a0,
+                analysis_end=a1,
+                cutoffs=cutoffs,
+                event_mode=event_mode,
+                cooldown_sessions=cooldown_sessions,
+            )
+            print_audit_table(console, regimes, title=f"Regime audit (ANALYSIS-frozen VIX) | {row.pattern}")
+    console.print("[dim]MINING_RESULT_PERSISTENCE_ENABLED=false. Thresholds were not retuned on VALIDATION.[/dim]")
+
+
+@mine_app.command("walk-forward")
+def mine_walkforward_cmd(
+    target: str = typer.Option("forward_excess_spy_20d", "--target"),
+    full_discover: bool = typer.Option(False, "--full-discover", help="Re-run pair discovery on each fold (slow)."),
+    event_mode: str = typer.Option("state", "--event-mode"),
+    cooldown_sessions: int = typer.Option(0, "--cooldown-sessions"),
+    max_rule_size: int = typer.Option(2, "--max-rule-size"),
+) -> None:
+    """Expanding-window walk-forward. Fold cutoffs freeze on that fold only. No FUTURE_HOLDOUT eval."""
+    settings = _bootstrap()
+    from app.mining.cli import print_walkforward
+    from app.mining.config import ANALYSIS_START, FUTURE_HOLDOUT_START, PATTERN_FREEZE_POLICY, SMOKE_PATTERNS, WALK_FOLDS
+    from app.mining.data import load_mining_frame
+    from app.mining.persist import assert_no_mining_persist
+    from app.mining.walkforward import walk_forward
+
+    assert_no_mining_persist()
+    with analytics_connection(settings) as con:
+        console.print("[dim]Loading research-common-equity frame (memory only)...[/dim]")
+        frame, mature = load_mining_frame(settings, con, analysis_start=ANALYSIS_START, target=target)
+    if frame.height == 0:
+        raise typer.Exit(1)
+    console.print(f"[dim]Walk-forward target={target} mature={mature} FUTURE_HOLDOUT={FUTURE_HOLDOUT_START}[/dim]")
+    console.print(f"[dim]{PATTERN_FREEZE_POLICY}[/dim]")
+    report = None
+    logger = None
+    try:
+        if full_discover:
+            from app.mining.progress import WalkForwardLogger
+
+            logger = WalkForwardLogger(console, n_folds=len(WALK_FOLDS))
+        report = walk_forward(
+            frame,
+            target=target,
+            tracked=SMOKE_PATTERNS,
+            max_rule_size=max_rule_size,
+            event_mode=event_mode,
+            cooldown_sessions=cooldown_sessions,
+            mature=mature,
+            full_discover=full_discover,
+            progress=logger,
+        )
+    finally:
+        if logger is not None:
+            logger.close()
+    print_walkforward(console, report)
+    console.print("[dim]MINING_RESULT_PERSISTENCE_ENABLED=false.[/dim]")
+
+
+@mine_app.command("inspect")
+def mine_inspect_cmd(
+    pattern: list[str] = typer.Option(..., "--pattern", help="Repeatable. Example: rsi14_ge_70 AND volume_ratio20_gt_2"),
+    target: str = typer.Option("forward_excess_spy_20d", "--target"),
+    analysis_start: str = typer.Option("2018-01-02", "--analysis-start"),
+    analysis_end: str = typer.Option("2023-12-29", "--analysis-end"),
+    validation_start: str = typer.Option("2024-01-02", "--validation-start"),
+    validation_end: str | None = typer.Option(None, "--validation-end"),
+) -> None:
+    """Inspect named patterns: STATE vs ENTRY vs cooldown, parents, years, price/regime. Terminal only."""
+    settings = _bootstrap()
+    from app.mining.cli import print_inspect
+    from app.mining.config import PATTERN_FREEZE_POLICY
+    from app.mining.data import load_mining_frame
+    from app.mining.inspect import inspect_pattern, prepare_frozen_states
+    from app.mining.persist import assert_no_mining_persist
+
+    assert_no_mining_persist()
+    a0, a1 = _parse_date(analysis_start), _parse_date(analysis_end)
+    v0 = _parse_date(validation_start)
+    v1 = _parse_date(validation_end) if validation_end else None
+    if a0 is None or a1 is None or v0 is None:
+        raise typer.Exit(1)
+    with analytics_connection(settings) as con:
+        console.print("[dim]Loading research-common-equity frame (memory only)...[/dim]")
+        frame, mature = load_mining_frame(settings, con, analysis_start=a0, validation_end=v1, target=target)
+    if frame.height == 0:
+        raise typer.Exit(1)
+    console.print(f"[dim]{PATTERN_FREEZE_POLICY} mature={mature}[/dim]")
+    stated, specs, frozen, cutoffs = prepare_frozen_states(frame, target=target, analysis_start=a0, analysis_end=a1)
+    for pat in pattern:
+        report = inspect_pattern(
+            stated,
+            pat,
+            target=target,
+            analysis_start=a0,
+            analysis_end=a1,
+            validation_start=v0,
+            validation_end=v1 or mature,
+            specs=specs,
+            frozen=frozen,
+            cutoffs=cutoffs,
+        )
+        print_inspect(console, report)
+    console.print("[dim]MINING_RESULT_PERSISTENCE_ENABLED=false. Inspect does not retune thresholds.[/dim]")
 
 
 @app.command("run-daily")
@@ -1004,8 +1723,15 @@ def run_daily_cmd(dry_run: bool = typer.Option(False, "--dry-run")) -> None:
     console.print(table)
     console.print(
         f"[bold]Tracked price securities:[/bold] {report.universe.tracked_for_prices} | "
-        f"[bold]Prices latest date:[/bold] {report.prices.latest_date} | "
+        f"[bold]Prices latest date:[/bold] {format_session_date(report.prices.latest_date)} | "
         f"[bold]Open critical issues:[/bold] {report.data_quality.critical_open}"
+    )
+    console.print(
+        f"[bold]Price network:[/bold] symbols_requested={pipeline.price_symbols_requested} "
+        f"symbols_skipped_current={pipeline.price_symbols_skipped_current} "
+        f"batches_requested={pipeline.price_batches_requested} "
+        f"rows_received={pipeline.price_rows_received} "
+        f"provider_fetch_count={pipeline.price_provider_fetch_count}"
     )
     if pipeline.aborted:
         raise typer.Exit(1)

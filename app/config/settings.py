@@ -48,6 +48,26 @@ class Settings(BaseSettings):
     max_feature_lookback_sessions: int = Field(default=300, ge=50, le=2000)
     label_recompute_sessions: int = Field(default=30, ge=20, le=120)
     price_request_pause_seconds: float = Field(default=0.0, ge=0, le=10)
+    daily_price_lookback_sessions: int = Field(
+        default=3,
+        ge=1,
+        le=20,
+        description="Trading sessions before a stale name's last stored session to re-fetch on daily sync.",
+    )
+    price_repair_lookback_sessions: int = Field(
+        default=20,
+        ge=5,
+        le=60,
+        description="Trading sessions re-fetched by weekly price repair, ending at expected latest.",
+    )
+    indicator_persistence_enabled: bool = Field(
+        default=False,
+        description="Must stay false in v1. Indicator results are memory-only.",
+    )
+    mining_result_persistence_enabled: bool = Field(
+        default=False,
+        description="Must stay false in v1. Mining results are memory-only / CLI output.",
+    )
     duckdb_threads: int = Field(default=6, ge=1, le=64)
     duckdb_memory_limit: str = Field(default="24GB")
 
@@ -133,6 +153,18 @@ class Settings(BaseSettings):
     def labels_forward_returns_dir(self) -> Path:
         return self.lake_dir / "labels_forward_returns"
 
+    @property
+    def research_dir(self) -> Path:
+        return self.data_root / "research"
+
+    @property
+    def sec_user_agent_configured(self) -> bool:
+        return bool(self.sec_user_agent.strip())
+
+    @property
+    def fred_api_key_configured(self) -> bool:
+        return bool(self.fred_api_key.strip())
+
     def ensure_directories(self) -> None:
         """Create the standard directory skeleton if it does not exist yet."""
         for path in (
@@ -149,6 +181,7 @@ class Settings(BaseSettings):
             self.short_volume_dir,
             self.features_daily_dir,
             self.labels_forward_returns_dir,
+            self.research_dir,
             self.state_dir,
             self.checkpoints_dir,
             self.log_dir,

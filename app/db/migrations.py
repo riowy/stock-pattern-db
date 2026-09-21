@@ -12,10 +12,12 @@ import duckdb
 
 from app.config.settings import Settings
 from app.services.dataset_metadata_service import seed_research_integrity_metadata
+from app.services.instrument_classification_service import refresh_instrument_classifications
 from app.services.tracked_universe_service import (
     auto_register_from_existing_price_data,
     enable_feature_tracking_for_price_tracked,
 )
+from app.services.universe_membership_service import seed_scale_test_memberships_from_tracked
 from app.utils.logging import get_logger
 
 logger = get_logger("migrations")
@@ -35,3 +37,9 @@ def run_migrations(con: duckdb.DuckDBPyConnection, settings: Settings) -> None:
             newly_featured,
         )
     seed_research_integrity_metadata(con, settings)
+    classified = refresh_instrument_classifications(con, settings)
+    if classified:
+        logger.info("Migration: classified %d securities (instrument_class_complete=false)", classified)
+    seeded = seed_scale_test_memberships_from_tracked(con)
+    if seeded:
+        logger.info("Migration: seeded %d PROVIDER_SCALE_TEST universe memberships", seeded)
