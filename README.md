@@ -843,7 +843,20 @@ They **do not write** Parquet, CSV, DuckDB tables, `data/research`, manifests, o
 ```
 INDICATOR_PERSISTENCE_ENABLED=false
 MINING_RESULT_PERSISTENCE_ENABLED=false
+PATTERN_REGISTRY_PERSISTENCE_ENABLED=false
+DAILY_SIGNAL_PERSISTENCE_ENABLED=false
 ```
+
+Pattern-research registry / dashboard (modular; no live mining):
+
+```
+stockdb registry generators
+stockdb registry patterns
+stockdb registry generator-metrics
+stockdb registry dashboard --demo
+```
+
+`--demo` loads synthetic fixtures in memory and never creates `data/state/pattern_registry.duckdb`. Bind defaults to `127.0.0.1:8765`.
 
 Adjustment matches the feature engine: `factor = adj_close / close`. Invalid factor → indicator nulls (no silent raw-close fallback).
 

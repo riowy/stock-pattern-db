@@ -39,6 +39,10 @@ audit_app = typer.Typer(help="Audit data quality without mutating raw prices.")
 research_app = typer.Typer(help="Univariate feature research. Not recommendations or trading.")
 indicators_app = typer.Typer(help="On-demand technical indicators. Memory-only; never persisted.")
 mine_app = typer.Typer(help="Ephemeral pattern mining. Analysis discovers; validation only evaluates. Not trading.")
+registry_app = typer.Typer(
+    help="Pattern research registry (generators, patterns, metrics, local dashboard). "
+    "Persistence OFF by default; no live mining."
+)
 app.add_typer(validate_app, name="validate")
 app.add_typer(compact_app, name="compact")
 app.add_typer(universe_app, name="universe")
@@ -46,6 +50,7 @@ app.add_typer(audit_app, name="audit")
 app.add_typer(research_app, name="research")
 app.add_typer(indicators_app, name="indicators")
 app.add_typer(mine_app, name="mine")
+app.add_typer(registry_app, name="registry")
 
 console = Console()
 logger = get_logger("cli")
@@ -1693,6 +1698,168 @@ def mine_inspect_cmd(
         )
         print_inspect(console, report)
     console.print("[dim]MINING_RESULT_PERSISTENCE_ENABLED=false. Inspect does not retune thresholds.[/dim]")
+
+
+@registry_app.command("generators")
+def registry_generators_cmd() -> None:
+    """List generator registry (in-memory empty unless persistence/fixture enabled)."""
+    settings = _bootstrap()
+    from app.patterns.persistence import open_research_store
+
+    store = open_research_store(settings, force_memory=not settings.pattern_registry_persistence_enabled)
+    try:
+        gens = store.list_generators()
+        table = Table(title="Generator registry")
+        table.add_column("id")
+        table.add_column("name")
+        table.add_column("type")
+        table.add_column("status")
+        for g in gens:
+            table.add_row(g["generator_id"], g["name"], g["generator_type"], g["status"])
+        if not gens:
+            console.print(
+                "[yellow]No generators. Persistence is "
+                f"{'ON' if settings.pattern_registry_persistence_enabled else 'OFF'}.[/yellow]"
+            )
+        console.print(table)
+        console.print(
+            f"[dim]PATTERN_REGISTRY_PERSISTENCE_ENABLED="
+            f"{str(settings.pattern_registry_persistence_enabled).lower()}[/dim]"
+        )
+    finally:
+        store.close()
+
+
+@registry_app.command("patterns")
+def registry_patterns_cmd(
+    status: str | None = typer.Option(None, "--status"),
+    search: str | None = typer.Option(None, "--search"),
+) -> None:
+    """List pattern registry."""
+    settings = _bootstrap()
+    from app.patterns.persistence import open_research_store
+
+    store = open_research_store(settings, force_memory=not settings.pattern_registry_persistence_enabled)
+    try:
+        rows = store.list_patterns(status=status, search=search)
+        table = Table(title="Pattern registry")
+        table.add_column("pattern_id")
+        table.add_column("status")
+        table.add_column("direction")
+        table.add_column("target")
+        table.add_column("horizon")
+        table.add_column("hyp_fp")
+        for r in rows:
+            table.add_row(
+                r["pattern_id"],
+                r["status"],
+                r["direction"],
+                r["target"],
+                str(r["horizon"]),
+                r["hypothesis_fingerprint"][:12] + "…",
+            )
+        if not rows:
+            console.print("[yellow]No patterns in registry.[/yellow]")
+        console.print(table)
+    finally:
+        store.close()
+
+
+@registry_app.command("inspect-pattern")
+def registry_inspect_pattern_cmd(pattern_id: str = typer.Argument(...)) -> None:
+    """Inspect one pattern version + provenance."""
+    settings = _bootstrap()
+    from app.patterns.persistence import open_research_store
+
+    store = open_research_store(settings, force_memory=not settings.pattern_registry_persistence_enabled)
+    try:
+        rec = store.get_pattern_version(pattern_id)
+        if rec is None:
+            console.print(f"[red]Unknown pattern_id={pattern_id}[/red]")
+            raise typer.Exit(1)
+        console.print(f"[bold]{rec.pattern_id}[/bold] v{rec.version} status={rec.status}")
+        console.print(f"structural={rec.structural_fingerprint}")
+        console.print(f"hypothesis={rec.hypothesis_fingerprint}")
+        console.print(rec.definition.model_dump_json(indent=2))
+        events = store.list_discovery_events(pattern_id=pattern_id)
+        console.print(f"[dim]discovery events: {len(events)}[/dim]")
+        for e in events:
+            console.print(f"  {e['timestamp']} {e['generator_id']} {e['proposal_kind']}")
+    finally:
+        store.close()
+
+
+@registry_app.command("generator-metrics")
+def registry_generator_metrics_cmd(
+    generator_id: str | None = typer.Option(None, "--generator-id"),
+) -> None:
+    """Show generator performance / overlap metrics (no opaque single score)."""
+    settings = _bootstrap()
+    from app.discovery.metrics import all_pairwise_overlaps, compute_generator_metrics
+    from app.patterns.persistence import open_research_store
+
+    store = open_research_store(settings, force_memory=not settings.pattern_registry_persistence_enabled)
+    try:
+        ids = [generator_id] if generator_id else [g["generator_id"] for g in store.list_generators()]
+        if not ids:
+            console.print("[yellow]No generators.[/yellow]")
+            return
+        for gid in ids:
+            m = compute_generator_metrics(store, gid)
+            console.print(f"[bold]{gid}[/bold]")
+            for k, v in m.as_dict().items():
+                console.print(f"  {k}: {v}")
+        for o in all_pairwise_overlaps(store):
+            console.print(
+                f"overlap {o.generator_a}×{o.generator_b}: shared={o.shared_pattern_count} "
+                f"jaccard={o.jaccard_proposed:.3f} rej∩={o.overlap_rejected} pass∩={o.overlap_passed}"
+            )
+    finally:
+        store.close()
+
+
+@registry_app.command("dashboard")
+def registry_dashboard_cmd(
+    host: str = typer.Option("127.0.0.1", "--host"),
+    port: int = typer.Option(8765, "--port"),
+    demo: bool = typer.Option(
+        False,
+        "--demo",
+        help="Load synthetic fixtures into an in-memory store (never writes production registry).",
+    ),
+) -> None:
+    """Start the local research dashboard (127.0.0.1 by default)."""
+    settings = _bootstrap()
+    from app.dashboard.server import run_dashboard
+    from app.patterns.fixtures import seed_fixture_store
+    from app.patterns.persistence import open_research_store
+    from app.patterns.store import PatternResearchStore
+
+    if demo:
+        store = PatternResearchStore(persist=False).open()
+        seed_fixture_store(store)
+        console.print("[dim]Demo fixtures loaded in-memory. No production registry writes.[/dim]")
+        persist_flag = False
+        signal_flag = False
+    else:
+        store = open_research_store(settings, force_memory=not settings.pattern_registry_persistence_enabled)
+        persist_flag = settings.pattern_registry_persistence_enabled
+        signal_flag = settings.daily_signal_persistence_enabled
+        if not persist_flag:
+            console.print(
+                "[yellow]PATTERN_REGISTRY_PERSISTENCE_ENABLED=false — "
+                "dashboard will show empty state unless --demo is used.[/yellow]"
+            )
+    try:
+        run_dashboard(
+            store,
+            host=host,
+            port=port,
+            persistence_enabled=persist_flag,
+            signal_persistence_enabled=signal_flag,
+        )
+    finally:
+        store.close()
 
 
 @app.command("run-daily")
