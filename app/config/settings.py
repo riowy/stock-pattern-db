@@ -68,6 +68,14 @@ class Settings(BaseSettings):
         default=False,
         description="Must stay false in v1. Mining results are memory-only / CLI output.",
     )
+    pattern_registry_persistence_enabled: bool = Field(
+        default=False,
+        description="Independent gate for pattern-research registry DuckDB. OFF by default.",
+    )
+    daily_signal_persistence_enabled: bool = Field(
+        default=False,
+        description="Independent gate for daily research signal writes. OFF by default.",
+    )
     duckdb_threads: int = Field(default=6, ge=1, le=64)
     duckdb_memory_limit: str = Field(default="24GB")
 
@@ -116,6 +124,11 @@ class Settings(BaseSettings):
     @property
     def duckdb_path(self) -> Path:
         return self.state_dir / "catalog.duckdb"
+
+    @property
+    def pattern_registry_path(self) -> Path:
+        """Isolated research-registry store. Not the price lake / catalog."""
+        return self.state_dir / "pattern_registry.duckdb"
 
     @property
     def checkpoints_dir(self) -> Path:
