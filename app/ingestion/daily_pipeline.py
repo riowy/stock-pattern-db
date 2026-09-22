@@ -268,6 +268,13 @@ def run_daily_pipeline(
         add("price_validation", f"FAILED: {exc}", failed=True, abort=True)
         return out
 
+    if not settings.derived_data_persistence_enabled:
+        add("features", "SKIPPED - derived persistence disabled")
+        add("labels", "SKIPPED - derived persistence disabled")
+        add("feature_label_validation", "SKIPPED - derived persistence disabled")
+        add("report", "status collected")
+        return out
+
     feat_start = _feature_daily_start(con, settings)
     try:
         if feat_start is None:

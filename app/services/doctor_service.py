@@ -118,6 +118,19 @@ def run_doctor(settings: Settings, con: duckdb.DuckDBPyConnection | None = None)
     else:
         report.add("commercial_mode", STATUS_OK, "false")
 
+    if settings.derived_data_persistence_enabled:
+        report.add(
+            "derived_data_persistence",
+            STATUS_OK,
+            "enabled — features_daily / labels_forward_returns writes active",
+        )
+    else:
+        report.add(
+            "derived_data_persistence",
+            STATUS_OK,
+            "disabled — source-only soak; features/labels skipped (existing derived data preserved)",
+        )
+
     try:
         calendar = MarketCalendarService(settings.market_calendar, settings.market_data_grace_minutes)
         friday = date(2026, 9, 18)
@@ -219,8 +232,11 @@ def run_doctor(settings: Settings, con: duckdb.DuckDBPyConnection | None = None)
 
 
 def _recon_detail(recon) -> str:  # noqa: ANN001
-    return (
+    detail = (
         f"PRICE_WITH_FEATURE={recon.price_with_feature} "
         f"PRICE_NO_FEATURE_EXPECTED={recon.price_no_feature_expected} "
         f"PRICE_NO_FEATURE_UNEXPECTED={recon.price_no_feature_unexpected}"
     )
+    if "DERIVED_DATA_PERSISTENCE_ENABLED=false" in (recon.note or ""):
+        detail += " (derived persistence disabled; missing features expected)"
+    return detail

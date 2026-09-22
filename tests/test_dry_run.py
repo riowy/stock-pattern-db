@@ -188,7 +188,6 @@ def test_dry_run_leaves_lake_file_count_unchanged(con, settings, monkeypatch) ->
 
 def test_dry_run_daily_pipeline_includes_feature_label_steps(con, settings, monkeypatch) -> None:
     from app.ingestion.daily_pipeline import run_daily_pipeline
-    from app.ingestion.universe_sync import sync_universe
     from app.providers.security_master.sec_provider import SecUniverseProvider
     from app.providers.volatility.cboe_vix_provider import CboeVixProvider
     from app.providers.price.yfinance_provider import YFinancePriceProvider
@@ -197,14 +196,30 @@ def test_dry_run_daily_pipeline_includes_feature_label_steps(con, settings, monk
     monkeypatch.setattr(CboeVixProvider, "fetch_history", _fail_if_called)
     monkeypatch.setattr(YFinancePriceProvider, "fetch_daily_bars", _fail_if_called)
 
+    # Soak default: derived persistence off — steps still present, clearly skipped.
+    assert settings.derived_data_persistence_enabled is False
     result = run_daily_pipeline(settings, con, dry_run=True)
     names = [s.name for s in result.steps]
     assert "features" in names
     assert "labels" in names
     assert "feature_label_validation" in names
+    by_name = {s.name: s.result for s in result.steps}
+    assert by_name["features"] == "SKIPPED - derived persistence disabled"
+    assert by_name["labels"] == "SKIPPED - derived persistence disabled"
+    assert by_name["feature_label_validation"] == "SKIPPED - derived persistence disabled"
+    assert "prices" in by_name
     _assert_no_mutations(con, settings)
     assert not any(settings.lake_dir.rglob("*.parquet"))
 
     again = run_daily_pipeline(settings, con, dry_run=True)
     assert [s.name for s in again.steps] == names
     _assert_no_mutations(con, settings)
+
+    # With derived persistence enabled, dry-run still plans features/labels without mutation.
+    settings.derived_data_persistence_enabled = True
+    enabled = run_daily_pipeline(settings, con, dry_run=True)
+    enabled_by = {s.name: s.result for s in enabled.steps}
+    assert "SKIPPED - derived persistence disabled" not in enabled_by["features"]
+    assert "SKIPPED - derived persistence disabled" not in enabled_by["labels"]
+    _assert_no_mutations(con, settings)
+    assert not any(settings.lake_dir.rglob("*.parquet"))

@@ -65,6 +65,7 @@ def _price_rows(security_id: str, ticker: str, start: date, n: int) -> pl.DataFr
 
 
 def test_expected_vs_unexpected_missing_feature_rows(con, settings) -> None:
+    settings.derived_data_persistence_enabled = True
     _sec(con, "FEAT1", "AAA")
     _sec(con, "PRICEONLY", "BBB")
     add_tracked(con, ["FEAT1"], reason="test", feature_tracking=True)
@@ -112,6 +113,7 @@ def test_expected_vs_unexpected_missing_feature_rows(con, settings) -> None:
 
 
 def test_feature_daily_start_includes_recent_missing_identity_rows(con, settings) -> None:
+    settings.derived_data_persistence_enabled = True
     _sec(con, "FEAT1", "AAA")
     add_tracked(con, ["FEAT1"], reason="test", feature_tracking=True)
     prices = LakeDataset(

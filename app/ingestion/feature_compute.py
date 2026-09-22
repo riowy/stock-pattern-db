@@ -88,6 +88,17 @@ def compute_features(
     resume: bool = False,
     dry_run: bool = False,
 ) -> ComputeResult:
+    if not settings.derived_data_persistence_enabled:
+        logger.info("SKIPPED - derived persistence disabled (features_daily)")
+        return ComputeResult(
+            run_id=None,
+            total_symbols=0,
+            successful=0,
+            failed=0,
+            rows_written=0,
+            dry_run=dry_run,
+        )
+
     targets = resolve_feature_targets(con, symbols)
     plan = plan_feature_compute(con, settings, symbols, start, end, version)
     if dry_run:

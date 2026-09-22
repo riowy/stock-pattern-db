@@ -31,6 +31,8 @@ def test_doctor_reports_ok_warn_fail_and_hides_secrets(con, settings) -> None:
     assert names["SEC_USER_AGENT"].detail == "configured"
     assert names["FRED_API_KEY"].status == STATUS_OK
     assert names["commercial_mode"].status == STATUS_OK
+    assert names["derived_data_persistence"].status == STATUS_OK
+    assert "disabled" in names["derived_data_persistence"].detail.lower()
     assert names["market_calendar"].status == STATUS_OK
     assert any(c.status in (STATUS_OK, STATUS_FAIL) for c in report.checks)
 

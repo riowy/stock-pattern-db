@@ -393,6 +393,7 @@ def test_single_symbol_failure_does_not_abort_job(con, settings, monkeypatch) ->
 
 
 def test_features_and_labels_skip_when_prices_already_current(con, settings, monkeypatch) -> None:
+    settings.derived_data_persistence_enabled = True
     _insert_security(con, "S0", "AAA")
     add_tracked(con, ["S0"], reason="test", feature_tracking=True)
     _write_prices(settings, [("S0", FRIDAY, 1.0)])

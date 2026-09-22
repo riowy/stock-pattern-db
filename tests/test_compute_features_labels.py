@@ -18,6 +18,13 @@ from app.utils.parquet_io import LakeDataset
 
 
 @pytest.fixture
+def settings(settings):  # noqa: F811
+    """Feature/label compute tests exercise the enabled pipeline."""
+    settings.derived_data_persistence_enabled = True
+    return settings
+
+
+@pytest.fixture
 def con() -> duckdb.DuckDBPyConnection:
     c = duckdb.connect(":memory:")
     apply_schema(c)

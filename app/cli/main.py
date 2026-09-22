@@ -1396,6 +1396,23 @@ def status() -> None:
     ri_table.add_row("Commercial use safe", "YES" if report.research_integrity.commercial_use_safe else "NO")
     console.print(ri_table)
 
+    persist_table = Table(title="Persistence mode")
+    persist_table.add_column("Flag")
+    persist_table.add_column("Value", justify="right")
+    persist_table.add_row(
+        "DERIVED_DATA_PERSISTENCE_ENABLED",
+        "true" if report.persistence.derived_data_persistence_enabled else "false (source-only soak)",
+    )
+    persist_table.add_row(
+        "INDICATOR_PERSISTENCE_ENABLED",
+        "true" if report.persistence.indicator_persistence_enabled else "false",
+    )
+    persist_table.add_row(
+        "MINING_RESULT_PERSISTENCE_ENABLED",
+        "true" if report.persistence.mining_result_persistence_enabled else "false",
+    )
+    console.print(persist_table)
+
 
 @app.command()
 def doctor() -> None:
@@ -1701,8 +1718,10 @@ def run_daily_cmd(dry_run: bool = typer.Option(False, "--dry-run")) -> None:
 
     Order: universe -> prices -> VIX -> optional FRED -> filings ->
     price validation -> incremental features -> recent label recompute ->
-    feature/label validation -> status. A single symbol failure does not
-    abort the job; catalog/schema/critical-validation failures do.
+    feature/label validation -> status. When DERIVED_DATA_PERSISTENCE_ENABLED
+    is false, features/labels (and their validation) are skipped. A single
+    symbol failure does not abort the job; catalog/schema/critical-validation
+    failures do.
     """
     settings = _bootstrap()
     from app.ingestion.daily_pipeline import run_daily_pipeline

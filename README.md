@@ -281,7 +281,7 @@ stockdb backfill-prices --start 2000-01-01 --batch-size 50 --resume
 ```bash
 stockdb sync-prices          # daily fast path: only STALE/NO_DATA tracked names; skip if already current
 stockdb repair-prices        # weekly repair: re-fetch last PRICE_REPAIR_LOOKBACK_SESSIONS for tracked names
-stockdb run-daily            # universe -> prices -> vix -> macro -> filings -> validate -> report
+stockdb run-daily            # universe -> prices -> vix -> macro -> filings -> validate -> (features/labels if DERIVED_DATA_PERSISTENCE_ENABLED)
 ```
 
 ### 8.1 What `--dry-run` actually guarantees
@@ -542,7 +542,7 @@ directory skeleton at the new location. Nothing else needs to change.
 | `stockdb universe remove TICKER...` | Soft-remove tickers from the tracked universe (history kept). |
 | `stockdb status` | Show DB/lake/job status as Rich tables (dates include English weekday; daily target vs known master). |
 | `stockdb doctor` | Pre-scheduler environment check (OK/WARN/FAIL). Does not print secrets. Does not register Task Scheduler. |
-| `stockdb run-daily [--dry-run]` | Daily pipeline: universe → prices → VIX → FRED → filings → validate → incremental features → recent labels → validate. |
+| `stockdb run-daily [--dry-run]` | Daily pipeline: universe → prices → VIX → FRED → filings → validate → incremental features → recent labels → validate. When `DERIVED_DATA_PERSISTENCE_ENABLED=false`, features/labels are skipped (`SKIPPED - derived persistence disabled`). |
 | `stockdb indicators list [--group ...]` | List on-demand technical indicators (memory-only). |
 | `stockdb indicators show --symbol TICKER [--start] [--end] [--group] [--indicator] [--all] [--tail N]` | Compute indicators in memory and print a table. Never writes files. |
 | `stockdb mine run [--target] [--analysis-start/end] [--validation-start/end] [--event-mode state\|entry] [--cooldown-sessions N] [--max-rule-size 2] [--top 30]` | Discover on ANALYSIS; evaluate the frozen set on VALIDATION. No files written. Not recommendations. |
@@ -843,7 +843,19 @@ They **do not write** Parquet, CSV, DuckDB tables, `data/research`, manifests, o
 ```
 INDICATOR_PERSISTENCE_ENABLED=false
 MINING_RESULT_PERSISTENCE_ENABLED=false
+DERIVED_DATA_PERSISTENCE_ENABLED=false
 ```
+
+`DERIVED_DATA_PERSISTENCE_ENABLED=false` is the source-only soak mode: raw
+provider responses, `prices_daily`, corporate actions, VIX, SEC filings,
+security master / universe, and ingestion metadata keep updating, but
+`run-daily` skips feature/label computation and writes
+(`SKIPPED - derived persistence disabled`). Existing `features_daily` /
+`labels_forward_returns` files are left untouched. Price rows without
+feature rows are expected during soak and do not fail `stockdb doctor`.
+Set the flag back to `true` to restore the incremental feature/label
+pipeline (including historical recompute logic). Do not enable indicator
+or mining persistence in v1.
 
 Adjustment matches the feature engine: `factor = adj_close / close`. Invalid factor → indicator nulls (no silent raw-close fallback).
 

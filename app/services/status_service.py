@@ -124,6 +124,13 @@ class DailyStatus:
 
 
 @dataclass
+class PersistenceModeStatus:
+    derived_data_persistence_enabled: bool = False
+    indicator_persistence_enabled: bool = False
+    mining_result_persistence_enabled: bool = False
+
+
+@dataclass
 class StatusReport:
     universe: UniverseStatus
     prices: PricesStatus
@@ -137,6 +144,7 @@ class StatusReport:
     features: FeaturesStatus = field(default_factory=FeaturesStatus)
     labels: LabelsStatus = field(default_factory=LabelsStatus)
     daily: DailyStatus = field(default_factory=DailyStatus)
+    persistence: PersistenceModeStatus = field(default_factory=PersistenceModeStatus)
 
 
 def _dir_size(path: Path) -> int:
@@ -398,6 +406,24 @@ def gather_status(settings: Settings, con: duckdb.DuckDBPyConnection) -> StatusR
         failed_symbols=sorted(set(failed_symbols))[:20],
     )
 
+    persistence = PersistenceModeStatus(
+        derived_data_persistence_enabled=settings.derived_data_persistence_enabled,
+        indicator_persistence_enabled=settings.indicator_persistence_enabled,
+        mining_result_persistence_enabled=settings.mining_result_persistence_enabled,
+    )
+
     return StatusReport(
-        universe, prices, macro, vix, sec, storage, jobs, dq, research_integrity, features, labels, daily
+        universe,
+        prices,
+        macro,
+        vix,
+        sec,
+        storage,
+        jobs,
+        dq,
+        research_integrity,
+        features,
+        labels,
+        daily,
+        persistence,
     )
