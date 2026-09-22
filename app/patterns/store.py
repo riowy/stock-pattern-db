@@ -300,18 +300,55 @@ class PatternResearchStore:
                 [generator_id, name, generator_type, status, created, notes],
             )
 
+    # Immutable generator_version fields compared on re-insert.
+    # Timestamp policy: created_at is assigned at first insert and ignored on
+    # idempotent re-insert (callers often pass datetime.now()). retired_at is
+    # part of the frozen version payload and is compared.
+    _GENERATOR_VERSION_IMMUTABLE_KEYS: tuple[str, ...] = (
+        "implementation_module_id",
+        "configuration_hash",
+        "code_version",
+        "git_commit",
+        "ai_provider",
+        "ai_model",
+        "ai_model_version",
+        "prompt_template_id",
+        "prompt_template_hash",
+        "temperature",
+        "settings_json",
+        "retired_at",
+    )
+
     def insert_generator_version(self, row: dict[str, Any]) -> None:
-        """Insert an immutable generator version. Raises if (id, version) exists with different payload."""
+        """Insert an immutable generator version. Raises if (id, version) exists with different payload.
+
+        Identical re-inserts are no-ops. Divergent immutable metadata under the
+        same generator_id/version is rejected — bump the version string instead.
+
+        Timestamp policy: ``created_at`` is not compared (first-insert value is
+        kept). ``retired_at`` is compared as immutable version metadata.
+        """
         existing = self._fetchone(
-            "SELECT configuration_hash, settings_json FROM generator_versions WHERE generator_id = ? AND version = ?",
+            """
+            SELECT implementation_module_id, configuration_hash, code_version, git_commit,
+                   ai_provider, ai_model, ai_model_version, prompt_template_id,
+                   prompt_template_hash, temperature, settings_json, retired_at
+            FROM generator_versions WHERE generator_id = ? AND version = ?
+            """,
             [row["generator_id"], row["version"]],
         )
         if existing:
-            # Immutability: identical re-insert is ok; divergent payload is rejected.
-            if existing[0] != row.get("configuration_hash") or existing[1] != row.get("settings_json"):
+            stored = dict(zip(self._GENERATOR_VERSION_IMMUTABLE_KEYS, existing, strict=True))
+            mismatches = [
+                key
+                for key in self._GENERATOR_VERSION_IMMUTABLE_KEYS
+                if not self._generator_version_values_equal(stored[key], row.get(key))
+            ]
+            if mismatches:
                 raise ValueError(
                     f"Generator version {row['generator_id']}@{row['version']} is immutable; "
-                    "create a new version instead of overwriting."
+                    f"divergent fields: {', '.join(mismatches)}. "
+                    "Create a new version instead of overwriting."
                 )
             return
         self._exec(
@@ -341,6 +378,33 @@ class PatternResearchStore:
                 row.get("retired_at"),
             ],
         )
+
+    @staticmethod
+    def _generator_version_values_equal(stored: Any, incoming: Any) -> bool:
+        """Compare immutable version field values with light normalization."""
+        if stored is None and incoming is None:
+            return True
+        if stored is None or incoming is None:
+            return False
+        if isinstance(stored, float) or isinstance(incoming, float):
+            try:
+                return float(stored) == float(incoming)
+            except (TypeError, ValueError):
+                return False
+        if isinstance(stored, datetime) or isinstance(incoming, datetime):
+            # Normalize aware/naive UTC for DuckDB round-trips.
+            def _as_utc(v: Any) -> datetime | None:
+                if not isinstance(v, datetime):
+                    return None
+                if v.tzinfo is None:
+                    return v.replace(tzinfo=UTC)
+                return v.astimezone(UTC)
+
+            a, b = _as_utc(stored), _as_utc(incoming)
+            if a is None or b is None:
+                return False
+            return a == b
+        return stored == incoming
 
     def set_generator_status(self, generator_id: str, status: str, *, retired_at: datetime | None = None) -> None:
         if status == "ACTIVE":

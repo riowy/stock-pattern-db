@@ -81,11 +81,15 @@ class GeneratorRegistry:
         version: GeneratorVersionSpec,
         notes: str | None = None,
     ) -> None:
+        # Re-registration must not silently reactivate DISABLED/RETIRED generators.
+        # Only restore() may return status to ACTIVE.
+        existing = self.store.get_generator(generator_id)
+        status = existing["status"] if existing is not None else str(GeneratorStatus.ACTIVE)
         self.store.upsert_generator(
             generator_id=generator_id,
             name=name,
             generator_type=str(generator_type),
-            status=str(GeneratorStatus.ACTIVE),
+            status=status,
             notes=notes,
         )
         settings_json = json.dumps(version.settings, sort_keys=True, default=str) if version.settings else None

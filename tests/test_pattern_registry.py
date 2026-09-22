@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
@@ -174,7 +174,7 @@ def test_generator_version_immutable_and_manual_retire_preserves_history() -> No
                     "settings_json": '{"a": 2}',
                 }
             )
-        # Identical re-insert ok
+        # Identical re-insert ok (created_at ignored; other immutable fields match)
         store.insert_generator_version(
             {
                 "generator_id": "g1",
@@ -195,6 +195,186 @@ def test_generator_version_immutable_and_manual_retire_preserves_history() -> No
         assert len(gens.versions("g1")) == 1
         gens.restore("g1")
         assert gens.get("g1")["status"] == str(GeneratorStatus.ACTIVE)
+    finally:
+        store.close()
+
+
+def test_reregister_preserves_disabled_and_retired_status() -> None:
+    """Re-register must not silently reactivate; only restore() returns to ACTIVE."""
+    store = PatternResearchStore(persist=False).open()
+    try:
+        gens = GeneratorRegistry(store)
+        base = GeneratorVersionSpec(generator_id="g_disabled", version="1")
+        gens.register(
+            generator_id="g_disabled",
+            name="Disabled Gen",
+            generator_type=GeneratorType.MINING_ENGINE,
+            version=base,
+        )
+        gens.disable("g_disabled", actor="tester")
+        assert gens.get("g_disabled")["status"] == str(GeneratorStatus.DISABLED)
+
+        gens.register(
+            generator_id="g_disabled",
+            name="Disabled Gen Renamed",
+            generator_type=GeneratorType.MINING_ENGINE,
+            version=base,
+        )
+        assert gens.get("g_disabled")["status"] == str(GeneratorStatus.DISABLED)
+        assert gens.get("g_disabled")["name"] == "Disabled Gen Renamed"
+
+        gens.restore("g_disabled", actor="tester")
+        assert gens.get("g_disabled")["status"] == str(GeneratorStatus.ACTIVE)
+
+        retired_spec = GeneratorVersionSpec(generator_id="g_retired", version="1")
+        gens.register(
+            generator_id="g_retired",
+            name="Retired Gen",
+            generator_type=GeneratorType.AI,
+            version=retired_spec,
+        )
+        gens.retire("g_retired", actor="tester")
+        assert gens.get("g_retired")["status"] == str(GeneratorStatus.RETIRED)
+        assert gens.get("g_retired")["retired_at"] is not None
+
+        gens.register(
+            generator_id="g_retired",
+            name="Retired Gen Still",
+            generator_type=GeneratorType.AI,
+            version=retired_spec,
+        )
+        g = gens.get("g_retired")
+        assert g is not None
+        assert g["status"] == str(GeneratorStatus.RETIRED)
+        assert g["retired_at"] is not None
+        assert g["name"] == "Retired Gen Still"
+
+        gens.restore("g_retired", actor="tester")
+        assert gens.get("g_retired")["status"] == str(GeneratorStatus.ACTIVE)
+        assert gens.get("g_retired")["retired_at"] is None
+    finally:
+        store.close()
+
+
+def test_generator_version_rejects_divergent_immutable_metadata() -> None:
+    """Full immutable payload compared; model/prompt and implementation/git mismatches rejected."""
+    store = PatternResearchStore(persist=False).open()
+    try:
+        gens = GeneratorRegistry(store)
+        gens.register(
+            generator_id="ai1",
+            name="AI",
+            generator_type=GeneratorType.AI,
+            version=GeneratorVersionSpec(
+                generator_id="ai1",
+                version="1",
+                implementation_module_id="app.discovery.adapter",
+                configuration_hash=hash_configuration({"x": 1}),
+                code_version="0.1.0",
+                git_commit="abc123",
+                ai_provider="openai",
+                ai_model="gpt-test",
+                ai_model_version="2024-01",
+                prompt_template_id="tpl-v1",
+                prompt_template_hash="hash-v1",
+                temperature=0.0,
+                settings={"x": 1},
+            ),
+        )
+        # Model / prompt metadata divergence
+        with pytest.raises(ValueError, match="immutable|divergent"):
+            store.insert_generator_version(
+                {
+                    "generator_id": "ai1",
+                    "version": "1",
+                    "implementation_module_id": "app.discovery.adapter",
+                    "configuration_hash": hash_configuration({"x": 1}),
+                    "code_version": "0.1.0",
+                    "git_commit": "abc123",
+                    "ai_provider": "openai",
+                    "ai_model": "gpt-other",
+                    "ai_model_version": "2024-01",
+                    "prompt_template_id": "tpl-v1",
+                    "prompt_template_hash": "hash-v1",
+                    "temperature": 0.0,
+                    "settings_json": '{"x": 1}',
+                }
+            )
+        with pytest.raises(ValueError, match="immutable|divergent"):
+            store.insert_generator_version(
+                {
+                    "generator_id": "ai1",
+                    "version": "1",
+                    "implementation_module_id": "app.discovery.adapter",
+                    "configuration_hash": hash_configuration({"x": 1}),
+                    "code_version": "0.1.0",
+                    "git_commit": "abc123",
+                    "ai_provider": "openai",
+                    "ai_model": "gpt-test",
+                    "ai_model_version": "2024-01",
+                    "prompt_template_id": "tpl-v2",
+                    "prompt_template_hash": "hash-v2",
+                    "temperature": 0.0,
+                    "settings_json": '{"x": 1}',
+                }
+            )
+        # Implementation / git metadata divergence
+        with pytest.raises(ValueError, match="immutable|divergent"):
+            store.insert_generator_version(
+                {
+                    "generator_id": "ai1",
+                    "version": "1",
+                    "implementation_module_id": "app.discovery.other",
+                    "configuration_hash": hash_configuration({"x": 1}),
+                    "code_version": "0.1.0",
+                    "git_commit": "abc123",
+                    "ai_provider": "openai",
+                    "ai_model": "gpt-test",
+                    "ai_model_version": "2024-01",
+                    "prompt_template_id": "tpl-v1",
+                    "prompt_template_hash": "hash-v1",
+                    "temperature": 0.0,
+                    "settings_json": '{"x": 1}',
+                }
+            )
+        with pytest.raises(ValueError, match="immutable|divergent"):
+            store.insert_generator_version(
+                {
+                    "generator_id": "ai1",
+                    "version": "1",
+                    "implementation_module_id": "app.discovery.adapter",
+                    "configuration_hash": hash_configuration({"x": 1}),
+                    "code_version": "0.2.0",
+                    "git_commit": "def456",
+                    "ai_provider": "openai",
+                    "ai_model": "gpt-test",
+                    "ai_model_version": "2024-01",
+                    "prompt_template_id": "tpl-v1",
+                    "prompt_template_hash": "hash-v1",
+                    "temperature": 0.0,
+                    "settings_json": '{"x": 1}',
+                }
+            )
+        # Identical payload (different created_at) must still be accepted
+        store.insert_generator_version(
+            {
+                "generator_id": "ai1",
+                "version": "1",
+                "implementation_module_id": "app.discovery.adapter",
+                "configuration_hash": hash_configuration({"x": 1}),
+                "code_version": "0.1.0",
+                "git_commit": "abc123",
+                "ai_provider": "openai",
+                "ai_model": "gpt-test",
+                "ai_model_version": "2024-01",
+                "prompt_template_id": "tpl-v1",
+                "prompt_template_hash": "hash-v1",
+                "temperature": 0.0,
+                "settings_json": '{"x": 1}',
+                "created_at": datetime.now(UTC),
+            }
+        )
+        assert len(store.list_generator_versions("ai1")) == 1
     finally:
         store.close()
 
