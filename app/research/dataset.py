@@ -364,8 +364,18 @@ def reconcile_price_feature_rows(settings: Settings, con: duckdb.DuckDBPyConnect
     out.price_rows = con.execute("SELECT count(*) FROM prices_daily").fetchone()[0] or 0
     if "features_daily" in names:
         out.feature_rows = con.execute("SELECT count(*) FROM features_daily").fetchone()[0] or 0
+
+    derived_paused = not settings.derived_data_persistence_enabled
+    if derived_paused:
+        out.note = (
+            "DERIVED_DATA_PERSISTENCE_ENABLED=false: price rows without feature rows "
+            "are expected during source-only soak; missing derived identity rows do not "
+            "fail doctor."
+        )
+
     if "features_daily" not in names:
-        # No feature lake yet: every feature-tracked price row is unexpected once tracking exists.
+        # No feature lake yet: every feature-tracked price row is unexpected once tracking exists
+        # — unless derived persistence is paused for soak.
         rows = con.execute(
             """
             SELECT
@@ -375,9 +385,15 @@ def reconcile_price_feature_rows(settings: Settings, con: duckdb.DuckDBPyConnect
             LEFT JOIN tracked_securities t ON t.security_id = p.security_id AND t.enabled = TRUE
             """
         ).fetchone()
-        out.price_no_feature_expected = int(rows[0] or 0)
-        out.price_no_feature_unexpected = int(rows[1] or 0)
-        out.expected_not_feature_tracked = out.price_no_feature_expected
+        not_tracked = int(rows[0] or 0)
+        tracked_missing = int(rows[1] or 0)
+        if derived_paused:
+            out.price_no_feature_expected = not_tracked + tracked_missing
+            out.price_no_feature_unexpected = 0
+        else:
+            out.price_no_feature_expected = not_tracked
+            out.price_no_feature_unexpected = tracked_missing
+        out.expected_not_feature_tracked = not_tracked
         return out
 
     counts = con.execute(
@@ -398,25 +414,32 @@ def reconcile_price_feature_rows(settings: Settings, con: duckdb.DuckDBPyConnect
         """
     ).fetchone()
     out.price_with_feature = int(counts[0] or 0)
-    out.price_no_feature_expected = int(counts[1] or 0)
-    out.price_no_feature_unexpected = int(counts[2] or 0)
-    out.expected_not_feature_tracked = out.price_no_feature_expected
-    examples = con.execute(
-        """
-        SELECT p.security_id, p.ticker_at_time, p.date
-        FROM prices_daily p
-        LEFT JOIN features_daily f
-          ON f.security_id = p.security_id AND f.date = p.date
-        JOIN tracked_securities t
-          ON t.security_id = p.security_id AND t.enabled = TRUE AND t.feature_tracking = TRUE
-        WHERE f.security_id IS NULL
-        ORDER BY p.date, p.ticker_at_time
-        LIMIT 20
-        """
-    ).fetchall()
-    out.unexpected_examples = [
-        {"security_id": r[0], "ticker": r[1], "date": str(r[2])} for r in examples
-    ]
+    not_tracked_missing = int(counts[1] or 0)
+    tracked_missing = int(counts[2] or 0)
+    if derived_paused:
+        out.price_no_feature_expected = not_tracked_missing + tracked_missing
+        out.price_no_feature_unexpected = 0
+        out.unexpected_examples = []
+    else:
+        out.price_no_feature_expected = not_tracked_missing
+        out.price_no_feature_unexpected = tracked_missing
+        examples = con.execute(
+            """
+            SELECT p.security_id, p.ticker_at_time, p.date
+            FROM prices_daily p
+            LEFT JOIN features_daily f
+              ON f.security_id = p.security_id AND f.date = p.date
+            JOIN tracked_securities t
+              ON t.security_id = p.security_id AND t.enabled = TRUE AND t.feature_tracking = TRUE
+            WHERE f.security_id IS NULL
+            ORDER BY p.date, p.ticker_at_time
+            LIMIT 20
+            """
+        ).fetchall()
+        out.unexpected_examples = [
+            {"security_id": r[0], "ticker": r[1], "date": str(r[2])} for r in examples
+        ]
+    out.expected_not_feature_tracked = not_tracked_missing
     return out
 
 

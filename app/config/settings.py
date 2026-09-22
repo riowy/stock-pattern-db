@@ -68,6 +68,15 @@ class Settings(BaseSettings):
         default=False,
         description="Must stay false in v1. Mining results are memory-only / CLI output.",
     )
+    derived_data_persistence_enabled: bool = Field(
+        default=False,
+        description=(
+            "When False (source-only soak), pause new features_daily / "
+            "labels_forward_returns writes and skip their computation in run-daily. "
+            "Existing derived files are left untouched. Set True to restore the "
+            "feature/label pipeline."
+        ),
+    )
     duckdb_threads: int = Field(default=6, ge=1, le=64)
     duckdb_memory_limit: str = Field(default="24GB")
 
