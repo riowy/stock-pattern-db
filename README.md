@@ -366,6 +366,17 @@ not `stockdb.exe` (App Control has blocked that shim on some Windows
 installs). Administrator rights are typically required. Timezone is never
 hardcoded in Python; the Task Scheduler uses the machine's local clock.
 
+### Quick health check
+
+`doctor` checks runtime/config readiness, `status` summarizes current
+dataset/job state, and `storage-health` shows partition/file fragmentation:
+
+```bash
+uv run stockdb doctor
+uv run stockdb status
+uv run stockdb storage-health
+```
+
 ---
 
 ## 8.3 Features and labels (v1)
