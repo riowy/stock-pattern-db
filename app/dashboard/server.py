@@ -11,6 +11,12 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from app.aggregation.engine import SimpleCountAggregationEngine
+from app.dashboard.source_status import (
+    SourceFreshnessSummary,
+    SourceStatusProvider,
+    StaticSourceStatusProvider,
+    unavailable_source_status,
+)
 from app.discovery.generators import GeneratorRegistry
 from app.discovery.metrics import all_pairwise_overlaps, compute_generator_metrics, proposer_map
 from app.patterns.store import PatternResearchStore
@@ -87,15 +93,40 @@ class DashboardApp:
         signal_persistence_enabled: bool = False,
         host: str = "127.0.0.1",
         port: int = 8765,
+        source_status: SourceStatusProvider | None = None,
     ) -> None:
         self.store = store
         self.persistence_enabled = persistence_enabled
         self.signal_persistence_enabled = signal_persistence_enabled
         self.host = host
         self.port = port
+        self.source_status = source_status or StaticSourceStatusProvider(unavailable_source_status())
         self.generators = GeneratorRegistry(store)
         self.signals = SignalService(store)
         self.aggregator = SimpleCountAggregationEngine()
+
+    def _render_source_freshness(self) -> str:
+        summary: SourceFreshnessSummary = self.source_status.get_summary()
+        rows = [
+            ("Availability", summary.availability),
+            ("Message", summary.message),
+            ("Prices latest", summary.prices_latest or "—"),
+            ("Features latest", summary.features_latest or "—"),
+            ("Labels latest", summary.labels_latest or "—"),
+            ("Expected latest session", summary.expected_latest_session or "—"),
+        ]
+        if summary.tracked_note:
+            rows.append(("Note", summary.tracked_note))
+        rows_html = "".join(
+            f"<tr><th>{_esc(label)}</th><td>{_esc(value)}</td></tr>" for label, value in rows
+        )
+        return f"""
+        <section class="source-freshness" aria-label="Source data freshness">
+          <h2>Source data freshness</h2>
+          <p class="muted">Read-only summary. No network calls and no catalog/lake writes from this page.</p>
+          <table>{rows_html}</table>
+        </section>
+        """
 
     def make_handler(self) -> type[BaseHTTPRequestHandler]:
         app = self
@@ -197,8 +228,9 @@ class DashboardApp:
     # --- pages --------------------------------------------------------------------
 
     def render_overview(self, *, flash: str | None = None) -> str:
+        freshness_html = self._render_source_freshness()
         if not self.persistence_enabled and not self.store.list_generators() and not self.store.list_patterns():
-            body = """
+            body = freshness_html + """
             <div class="empty">
               <p><strong>Empty state.</strong> Pattern registry persistence is disabled
               (<code>PATTERN_REGISTRY_PERSISTENCE_ENABLED=false</code>) and no in-memory fixture data is loaded.</p>
@@ -268,7 +300,7 @@ class DashboardApp:
             f"{'ON' if self.persistence_enabled else 'OFF'} · "
             f"Signal persistence: {'ON' if self.signal_persistence_enabled else 'OFF'}</p>"
         )
-        return _layout("Overview", persist_note + cards_html, flash=flash)
+        return _layout("Overview", freshness_html + persist_note + cards_html, flash=flash)
 
     def render_generators(self, *, flash: str | None = None) -> str:
         gens = self.store.list_generators()
@@ -556,6 +588,7 @@ def run_dashboard(
     port: int = 8765,
     persistence_enabled: bool = False,
     signal_persistence_enabled: bool = False,
+    source_status: SourceStatusProvider | None = None,
 ) -> None:
     app = DashboardApp(
         store,
@@ -563,5 +596,6 @@ def run_dashboard(
         signal_persistence_enabled=signal_persistence_enabled,
         host=host,
         port=port,
+        source_status=source_status,
     )
     app.serve_forever()

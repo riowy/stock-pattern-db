@@ -856,7 +856,13 @@ stockdb registry generator-metrics
 stockdb registry dashboard --demo
 ```
 
-`--demo` loads synthetic fixtures in memory and never creates `data/state/pattern_registry.duckdb`. Bind defaults to `127.0.0.1:8765`.
+Windows-safe launch (when the `stockdb.exe` shim is blocked by App Control):
+
+```
+uv run python -m app.cli.main registry dashboard --demo
+```
+
+`--demo` loads synthetic fixtures in memory and never creates `data/state/pattern_registry.duckdb`. Bind defaults to `127.0.0.1:8765`. Overview shows a read-only source-data freshness summary; in demo/empty mode that summary is explicitly marked unavailable/demo (no network, no writes).
 
 Adjustment matches the feature engine: `factor = adj_close / close`. Invalid factor → indicator nulls (no silent raw-close fallback).
 

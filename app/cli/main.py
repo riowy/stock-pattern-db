@@ -1831,10 +1831,12 @@ def registry_dashboard_cmd(
     """Start the local research dashboard (127.0.0.1 by default)."""
     settings = _bootstrap()
     from app.dashboard.server import run_dashboard
+    from app.dashboard.source_status import default_dashboard_source_status
     from app.patterns.fixtures import seed_fixture_store
     from app.patterns.persistence import open_research_store
     from app.patterns.store import PatternResearchStore
 
+    source_status = default_dashboard_source_status(demo=demo, settings=settings)
     if demo:
         store = PatternResearchStore(persist=False).open()
         seed_fixture_store(store)
@@ -1857,6 +1859,7 @@ def registry_dashboard_cmd(
             port=port,
             persistence_enabled=persist_flag,
             signal_persistence_enabled=signal_flag,
+            source_status=source_status,
         )
     finally:
         store.close()

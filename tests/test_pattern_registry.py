@@ -366,6 +366,8 @@ def test_dashboard_empty_state_and_fixture_pages(tmp_path: Path) -> None:
         html = app.render_overview()
         assert "Empty state" in html
         assert "PATTERN_REGISTRY_PERSISTENCE_ENABLED=false" in html
+        assert "Source data freshness" in html
+        assert "unavailable" in html.lower()
     finally:
         empty.close()
 
@@ -378,6 +380,8 @@ def test_dashboard_empty_state_and_fixture_pages(tmp_path: Path) -> None:
         assert "Rejected" in app.render_rejected() or "rejected" in app.render_rejected().lower()
         patterns_html = app.render_patterns({})
         assert "pattern" in patterns_html.lower()
+        overview = app.render_overview()
+        assert "Source data freshness" in overview
         # Manual retire requires explicit POST with confirm=yes (handler logic covered via registry)
         gens = GeneratorRegistry(store)
         gens.retire("mine_a")
@@ -389,6 +393,66 @@ def test_dashboard_empty_state_and_fixture_pages(tmp_path: Path) -> None:
         assert len(store.list_discovery_events(generator_id="mine_a")) >= 1
     finally:
         store.close()
+
+
+def test_overview_source_freshness_demo_and_populated_rendering(tmp_path: Path) -> None:
+    """Overview always renders source-data freshness; demo/empty may be unavailable/demo."""
+    from app.dashboard.source_status import (
+        ReadOnlySourceStatusProvider,
+        SourceFreshnessSummary,
+        StaticSourceStatusProvider,
+        demo_source_status,
+    )
+
+    empty = PatternResearchStore(persist=False).open()
+    try:
+        demo_app = DashboardApp(
+            empty,
+            persistence_enabled=False,
+            source_status=StaticSourceStatusProvider(demo_source_status()),
+        )
+        demo_html = demo_app.render_overview()
+        assert "Source data freshness" in demo_html
+        assert "demo" in demo_html.lower()
+        assert "unavailable in demo mode" in demo_html.lower() or "demo mode" in demo_html.lower()
+        assert "Empty state" in demo_html
+
+        populated = StaticSourceStatusProvider(
+            SourceFreshnessSummary(
+                availability="ok",
+                message="Read-only lake freshness (no network, no writes).",
+                prices_latest="2026-09-22",
+                features_latest="2026-09-22",
+                labels_latest="2026-09-19",
+                expected_latest_session="2026-09-22",
+                tracked_note="fixture probe",
+            )
+        )
+        seeded = PatternResearchStore(persist=False).open()
+        try:
+            seed_fixture_store(seeded)
+            ok_app = DashboardApp(
+                seeded,
+                persistence_enabled=False,
+                source_status=populated,
+            )
+            ok_html = ok_app.render_overview()
+            assert "Source data freshness" in ok_html
+            assert "2026-09-22" in ok_html
+            assert "Prices latest" in ok_html
+            assert "no network" in ok_html.lower()
+        finally:
+            seeded.close()
+    finally:
+        empty.close()
+
+    # Missing lake → unavailable; must not create production registry path.
+    settings = _settings(tmp_path)
+    assert settings.pattern_registry_persistence_enabled is False
+    assert settings.daily_signal_persistence_enabled is False
+    summary = ReadOnlySourceStatusProvider(settings).get_summary()
+    assert summary.availability == "unavailable"
+    assert not registry_db_path(settings).exists()
 
 
 def test_aggregation_candidate_labels() -> None:
